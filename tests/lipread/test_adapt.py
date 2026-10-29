@@ -93,6 +93,24 @@ def test_a_file_with_other_tensors_is_refused(tmp_path, adapter_file):
         load_face_adapter(reader.model, str(tmp_path / 'bad.pth'))
 
 
+def test_averaged_adapters_are_the_mean_and_mismatched_files_are_refused(tmp_path, adapter_file):
+    import torch
+    from lipread.average_adapters import main
+    path, state = adapter_file
+    other = {k: v + 1.0 if v.is_floating_point() else v for k, v in state.items()}
+    other['encoder.embed.num_batches_tracked'] = torch.tensor(7)
+    first = dict(state, **{'encoder.embed.num_batches_tracked': torch.tensor(3)})
+    torch.save(first, tmp_path / 'a.pth')
+    torch.save(other, tmp_path / 'b.pth')
+    main([str(tmp_path / 'soup.pth'), str(tmp_path / 'a.pth'), str(tmp_path / 'b.pth')])
+    soup = torch.load(tmp_path / 'soup.pth', weights_only=True)
+    k = next(iter(state))
+    assert torch.allclose(soup[k], state[k] + 0.5, atol=1e-6) and soup['encoder.embed.num_batches_tracked'] == 3
+    torch.save({k: state[k]}, tmp_path / 'c.pth')
+    with pytest.raises(ValueError, match='same tensors'):
+        main([str(tmp_path / 'bad.pth'), str(tmp_path / 'a.pth'), str(tmp_path / 'c.pth')])
+
+
 class FakeReader:
     """Enough of a LipReader for word_ends: 4 tokens, two words, 'A' = 1 token, 'BC' = 2 tokens."""
     token_list = ['<blank>', '▁A', '▁B', 'C']
