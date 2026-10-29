@@ -5,6 +5,7 @@ per-frame timestamps (recorder/record.py + svr/recordings.py layout, and RECORDI
 """
 import json
 import os
+import sys
 import threading
 import time
 
@@ -356,3 +357,31 @@ def test_camera_source_exposes_fps_now(stall_cam, monkeypatch, caplog):
     src.close()
     assert src.fps_now == pytest.approx(50, abs=10)
     assert 'fps over the last' in caplog.text and caplog.text.count('fps over the last') == 1
+
+
+class DshowCap(StallCap):
+    """DirectShow after an open that asked for 30 fps: the rate reads -1. Records every rate set."""
+    fps_sets = []
+
+    def __init__(self, *a):
+        super().__init__(*a)
+        self.props[cv2.CAP_PROP_FPS] = -1.0
+
+    def set(self, k, v):
+        if k == cv2.CAP_PROP_FPS:
+            type(self).fps_sets.append(v)
+        return super().set(k, v)
+
+
+@pytest.mark.parametrize('platform, sets', [('linux', [30]), ('win32', [])])
+def test_a_reopen_sets_the_rate_again_except_on_directshow(stall_cam, monkeypatch, platform, sets):
+    """Setting the rate on DirectShow drops the C920 to 640x480 YUY2, so a reopened camera keeps the rate it opened
+    with there, as _pick_fps does at the first open."""
+    monkeypatch.setattr(source.cv2, 'VideoCapture', DshowCap)
+    monkeypatch.setattr(DshowCap, 'opened', 0)
+    monkeypatch.setattr(DshowCap, 'fps_sets', [])
+    monkeypatch.setattr(sys, 'platform', platform)
+    src = stall_cam([10, 20])
+    drain(src)
+    src.close()
+    assert src.reopens == 1 and src.cam_fps == 30 and DshowCap.fps_sets == sets

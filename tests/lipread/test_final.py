@@ -4,14 +4,18 @@ head, and finds the same fixes on the sample; the CPU child loads the face adapt
 
     venv-live/bin/python -m pytest tests/lipread/test_final.py -q
 """
+import os
+import sys
 import threading
 import time
 from collections import Counter
 
 import numpy as np
 import pytest
+import torch
 
 import lipread
+import lipread.final as final
 from bus import CamFinal, decode, encode, validate
 from lipread.final import FinalPass, GpuFinal, RemoteBeam, Rescore
 
@@ -339,3 +343,58 @@ def test_gpu_rescoring_on_the_sample(sample_video, face_model):
     assert sum((truth & Counter(texts[0].split())).values()) >= 15, texts[0]
     assert fp.rescore(x) == nbest
     print(f'\nGPU rescoring {ms:.0f} ms (T {len(x)}), best: {sent[0].nbest[0]}')
+
+
+class Loaded(Exception):
+    pass
+
+
+@pytest.mark.parametrize('windows', [False, True])
+def test_the_final_pass_child_ignores_the_launchers_stop_signal(monkeypatch, windows):
+    """The launcher stops the camera's whole process group (SIGINT on POSIX, CTRL_BREAK on Windows); the child ignores
+    it so the parent can finish its last segment and stop it."""
+    import signal
+    set_to = {}
+    if windows:
+        monkeypatch.setattr(signal, 'SIGBREAK', signal.SIGUSR1, raising=False)
+    else:
+        monkeypatch.delattr(signal, 'SIGBREAK', raising=False)
+    monkeypatch.setattr(signal, 'signal', lambda sig, handler: set_to.__setitem__(sig, handler))
+
+    def stop(nice):
+        raise Loaded
+    monkeypatch.setattr(final, 'lower_priority', stop)
+    with pytest.raises(Loaded):
+        final._child(None, None, {}, 'cpu', torch.get_num_threads(), 10)
+    assert set_to == {signal.SIGINT: signal.SIG_IGN, **({signal.SIGUSR1: signal.SIG_IGN} if windows else {})}
+
+
+def test_lower_priority_without_nice_uses_below_normal_priority_class(monkeypatch):
+    import ctypes
+    import types
+    calls = []
+    kernel32 = types.SimpleNamespace(GetCurrentProcess=lambda: -1, SetPriorityClass=lambda h, c: calls.append((h, c)))
+    monkeypatch.delattr(os, 'nice')
+    monkeypatch.setattr(sys, 'platform', 'win32')
+    monkeypatch.setattr(ctypes, 'windll', types.SimpleNamespace(kernel32=kernel32), raising=False)
+    final.lower_priority(0)
+    final.lower_priority(10)
+    assert calls == [(-1, 0x4000)]
+
+
+def test_the_final_pass_child_survives_a_spawn():
+    """Windows starts processes only by spawn: the target pickles by reference, and the modules a spawned child imports
+    (lipread.final, and lipread.run as the parent's __main__ under demo.run_part) import without side effects."""
+    import multiprocessing as mp
+    import pickle
+    from tests.lipread import fake_children
+    assert pickle.loads(pickle.dumps(final._child)) is final._child
+    ctx = mp.get_context('spawn')
+    results = ctx.Queue()
+    p = ctx.Process(target=fake_children.imports, args=(results, ['lipread.final', 'lipread.run', 'demo.run_part']))
+    p.start()
+    try:
+        assert results.get(timeout=120) == 'ok'
+    finally:
+        p.join(30)
+    assert p.exitcode == 0

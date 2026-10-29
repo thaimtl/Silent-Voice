@@ -502,7 +502,9 @@ class CameraSource:
                 return False
             cap = self._open()
             if cap is not None:
-                cap.set(cv2.CAP_PROP_FPS, self.cam_fps)
+                cur = cap.get(cv2.CAP_PROP_FPS)
+                if sys.platform != 'win32' or (cur > 0 and abs(cur - self.cam_fps) >= 1):   # as in _pick_fps
+                    cap.set(cv2.CAP_PROP_FPS, self.cam_fps)
                 if self.lock:
                     lock_controls(self.device, cap, self.exposure)
                 self.cap = cap

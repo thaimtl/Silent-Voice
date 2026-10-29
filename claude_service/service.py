@@ -45,7 +45,7 @@ def load_keys(call_dir=None):
         path = os.path.join(call_dir, name)
         if not os.path.exists(path):
             continue
-        with open(path) as f:
+        with open(path, encoding="utf-8-sig") as f:  # as demo/launch.py reads it; Windows' default is cp1252
             for line in f:
                 key, sep, value = line.strip().partition("=")
                 if sep and key.strip() == "ANTHROPIC_API_KEY" and value.strip().strip("'\""):

@@ -143,6 +143,8 @@ def _child(jobs, results, kw, device, threads, nice, face_adapter=None):
     CTC head if it has one) beams the encoder outputs it is sent. jobs: enc (T, D) float32, None stops -> results
     (nbest or error text, beam_ms)."""
     signal.signal(signal.SIGINT, signal.SIG_IGN)
+    if hasattr(signal, 'SIGBREAK'):     # Windows: the launcher's CTRL_BREAK reaches the whole group; the parent stops us
+        signal.signal(signal.SIGBREAK, signal.SIG_IGN)
     torch.set_num_threads(threads)
     lower_priority(nice)
     from lipflow.vsr import LipReader
