@@ -262,18 +262,24 @@ def test_the_camera_loads_the_face_adapter_and_preflight_needs_it(tmp_path, monk
     lc = launcher(tmp_path)
     cam = next(p for p in lc.plan() if p.name == 'Camera').cmd
     assert cam[cam.index('--face-adapter') + 1] == str(tmp_path / 'data' / 'face_adapter' / 'austin.pth')
+    keys = tmp_path / 'keys.env'
+    keys.write_text('')
+    lc.keys = {k: 'x' for k in launch.NEEDED_KEYS}
+    monkeypatch.setattr(launch, 'KEYS', keys)
+    monkeypatch.setattr(launch, 'venv_python', lambda work, venv: keys)
     monkeypatch.setattr(launch, 'gpu_ok', lambda: True)
+    monkeypatch.setattr(launch, 'charging', lambda: False)
+    monkeypatch.setattr(Launcher, 'cloudflared', lambda self: 'cloudflared')
     monkeypatch.setattr(Launcher, 'camera_opens', lambda self: True)
+    monkeypatch.setattr(Launcher, 'find_uno', lambda self: 'COM9')
     out = io.StringIO()
     with redirect_stdout(out):
-        lc.preflight()
+        assert not lc.preflight()
     assert 'face adapter data/face_adapter/austin.pth: copy austin.pth' in out.getvalue()
     (tmp_path / 'data' / 'face_adapter').mkdir(parents=True)
     (tmp_path / 'data' / 'face_adapter' / 'austin.pth').write_bytes(b'')
-    out = io.StringIO()
-    with redirect_stdout(out):
-        lc.preflight()
-    assert 'face adapter data/face_adapter/austin.pth' in out.getvalue() and 'copy austin.pth' not in out.getvalue()
+    with redirect_stdout(io.StringIO()):
+        assert lc.preflight()
 
 
 def test_record_inbound_is_always_off(tmp_path, monkeypatch):

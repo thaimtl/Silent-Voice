@@ -1,6 +1,7 @@
 """Rescoring a CTC read: a CTC prefix beam over the read's top-k, its n-best rescored by the attention decoder in one
 batched teacher-forced pass (the two-pass decoding of U2, https://arxiv.org/abs/2012.05481) and by Auto-AVSR's
-Transformer LM. lipread/streaming_eval.py scores it offline; lipread/run.py runs it on every tick.
+Transformer LM, as lipread/streaming_eval.py scores it offline. Nothing live runs it: every tick it cost +26 ms on
+the 5090 (beam 14 ms on the CPU, decoder 5, LM 5).
 """
 import numpy as np
 import torch
@@ -45,7 +46,8 @@ def ctc_prefix_beam(topk_ids, topk_logp, blank_logp, beam=8, per_frame=8, blank_
 
 @torch.inference_mode()
 def attention_scores_multi(model, encs, hyp_lists):
-    """attention_scores for several reads at once: encs (B, T, D) of the same T, hyp_lists[b] the hypotheses of read b.
+    """Attention-decoder log-prob of each hypothesis (token tuples, eos appended) for several reads in one batched
+    teacher-forced pass: encs (B, T, D) of the same T, hyp_lists[b] the hypotheses of read b.
     -> per read an array of scores."""
     flat = [(b, h) for b, hs in enumerate(hyp_lists) for h in hs]
     from espnet.nets.pytorch_backend.transformer.mask import subsequent_mask
