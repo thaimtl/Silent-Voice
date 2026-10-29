@@ -34,7 +34,7 @@ import torch
 
 import lipread
 from bus import bus_text
-from lipread.adapt import crops, norm, sentence_clips
+from lipread.adapt import crops, load_alignments, norm, save_alignments, sentence_clips
 from lipread.rescore import LOG0, attention_scores_multi, combined, ctc_prefix_beam, lm_scores
 from lipread.run import due_after
 from lipread.types import FPS
@@ -225,10 +225,7 @@ def tick_points(T, tick_ms=100):
 def truth(reader, aligner, clips, cache_path=None):
     """Per clip (words, starts, ends): the true words and their frame spans from the aligner's whole-clip read.
     cache_path: a JSON file keyed by clip id (the aligner is part of the caller's file name)."""
-    cached = {}
-    if cache_path and os.path.exists(cache_path):
-        with open(cache_path) as f:
-            cached = json.load(f)
+    cached = load_alignments(cache_path)
     out = []
     for c in clips:
         ids = tokenize(reader, c['text'])
@@ -242,9 +239,7 @@ def truth(reader, aligner, clips, cache_path=None):
             hit = cached[c['id']] = dict(words=words, starts=[int(x) for x in starts], ends=[int(x) for x in ends])
         out.append((hit['words'], hit['starts'], hit['ends']))
     if cache_path:
-        os.makedirs(os.path.dirname(os.path.abspath(cache_path)), exist_ok=True)
-        with open(cache_path, 'w') as f:
-            json.dump(cached, f)
+        save_alignments(cache_path, cached)
     return out
 
 

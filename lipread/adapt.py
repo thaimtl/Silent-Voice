@@ -9,9 +9,15 @@ same (lipread/MEASURED.md). Crops are made as live: the recording shrunk to --pr
     venv-live/bin/python -m lipread.adapt --sessions session_01 session_02         # train on everything, save
     venv-live/bin/python -m lipread.run --cam 0 --face-adapter data/face_adapter/austin.pth
 
-With --test-every or --test-sessions, the held-out clips are scored before and after (greedy = the tick reading,
-beam 5 + LM = the final pass) and the adapter is saved only if the final pass is not worse (--force saves anyway).
-Rest clips are skipped. A session is a folder under recordings/ (a renamed folder works: clips are read from the
+The default recipe is C (--recipe c: --cut-p 0.5 --ctc-weight 0.5 --train-ctc --extra-blocks 2, seen WER 0.275 vs
+0.314 for Lipflow's, 3 seeds, data/avsr_experiments/HANDOFF.md); --recipe lipflow is Lipflow's own, and any of the four
+flags overrides its part of the recipe. The cut augmentation needs word ends: a forced alignment on the base model,
+cached per clip in data/streaming_eval/align_base.json (lipread/streaming_eval.py's format).
+
+With --test-every or --test-sessions, the held-out clips are scored before and after: the streaming seen WER
+(lipread/streaming_eval.py, greedy, tick by tick as live) gates saving, and the final pass (beam 5 + LM) is reported
+beside it. The adapter is saved only if the seen WER is not worse (--force saves anyway). Without a held-out set
+neither the Beam nor the LM is built. Rest clips are skipped. A session is a folder under recordings/ (a renamed folder works: clips are read from the
 folder given, not the manifest's session field). Crops are cached per clip in data/face_adapter/crops/. The adapter
 goes to data/ in RECLAIM_WORKDIR (outside git); never train on session 3, the test session.
 """
@@ -31,6 +37,11 @@ from bus import bus_text
 from lipread.model import FACE_ADAPTER_PREFIXES
 from lipread.source import RECORDINGS, ReplaySource
 
+RECIPES = {
+    'c': dict(cut_p=0.5, ctc_weight=0.5, train_ctc=True, extra_blocks=2),
+    'lipflow': dict(cut_p=0.0, ctc_weight=0.1, train_ctc=False, extra_blocks=0),
+}
+ALIGN_CACHE = os.path.join(lipread.WORK, 'data', 'streaming_eval', 'align_base.json')
 DEFAULT_OUT = os.path.join(lipread.WORK, 'data', 'face_adapter', 'austin.pth')
 CROP_CACHE = os.path.join(lipread.WORK, 'data', 'face_adapter', 'crops')
 
@@ -97,6 +108,29 @@ def score(reader, beam, clips):
             sum(a == b for a, b in zip(ref, final)))
 
 
+def streaming_seen(clips, aligner, adapter=None, cache=ALIGN_CACHE):
+    """Streaming metrics (lipread/streaming_eval.py, greedy reading tick by tick, fp16 as live) of the base model, or
+    of the model with this adapter file, on clips [{'rois', 'text', 'id'}]: dict(seen_wer, final_wer, lag_p50, ...).
+    aligner: a LiveModel that times the true words. The model is freed on return."""
+    from lipread.model import LiveModel
+    from lipread.streaming_eval import evaluate
+    model = LiveModel(half=True, warmup=(), face_adapter=adapter)
+    try:
+        res, _, _ = evaluate(model, aligner, clips, rescore=False, align_cache=cache)
+    finally:
+        del model
+        torch.cuda.empty_cache()
+    return res['greedy']
+
+
+def resolve_recipe(recipe, cut_p=None, ctc_weight=None, train_ctc=None, extra_blocks=None):
+    """RECIPES[recipe] with any flag that was given (not None) on top."""
+    r = dict(RECIPES[recipe])
+    r.update({k: v for k, v in dict(cut_p=cut_p, ctc_weight=ctc_weight, train_ctc=train_ctc,
+                                    extra_blocks=extra_blocks).items() if v is not None})
+    return r
+
+
 def scope_params(reader, extra_blocks=0, train_ctc=False):
     """Lipflow's scope (front end, embed, Conformer block 0), plus the last extra_blocks Conformer blocks and the CTC
     head's projection: (parameters, state-dict prefixes). Everything else is frozen."""
@@ -116,15 +150,38 @@ def scope_params(reader, extra_blocks=0, train_ctc=False):
     return params, tuple(prefixes)
 
 
-def word_ends(reader, rois, ids):
-    """Frame after each true word's last frame, by CTC forced alignment on a whole-clip read (lipread.streaming_eval)."""
+def load_alignments(path):
+    """{clip id: dict(words, starts, ends)} from a JSON file (lipread/streaming_eval.py's alignment cache); {} if none."""
+    if path and os.path.exists(path):
+        with open(path) as f:
+            return json.load(f)
+    return {}
+
+
+def save_alignments(path, cache):
+    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+    with open(path + '.tmp', 'w') as f:
+        json.dump(cache, f)
+    os.replace(path + '.tmp', path)
+
+
+def word_ends(reader, rois, ids, clip_id=None, cache=None):
+    """(word_of, ends): per token its word, per word the frame after its last frame, by CTC forced alignment on a
+    whole-clip read (lipread.streaming_eval). cache: a dict from load_alignments, filled in place; a hit needs the
+    same clip id and the same words."""
     from lipread.streaming_eval import forced_align, token_words, word_spans
+    word_of, words = token_words(reader, ids)
+    hit = cache.get(clip_id) if cache is not None and clip_id is not None else None
+    if hit is not None and hit['words'] == words:
+        return word_of, hit['ends']
     with torch.inference_mode():
         x = reader.to_tensor(rois).unsqueeze(0).to(reader.enc_device)
         enc, _ = reader.model.encoder(x, None)
         logp = reader.model.ctc.log_softmax(enc)[0].float().cpu().numpy()
-    word_of, words = token_words(reader, ids)
-    _, ends = word_spans(forced_align(logp, ids), word_of, len(words))
+    starts, ends = word_spans(forced_align(logp, ids), word_of, len(words))
+    ends = [int(x) for x in ends]
+    if cache is not None and clip_id is not None:
+        cache[clip_id] = dict(words=words, starts=[int(x) for x in starts], ends=ends)
     return word_of, ends
 
 
@@ -164,10 +221,11 @@ def clip_loss(reader, x, ys, ctc_weight):
 
 
 def finetune(clips, reader, epochs=6, lr=1e-4, ctc_weight=0.1, cut_p=0.0, speed_spread=0.0, extra_blocks=0,
-             train_ctc=False, seed=0, log=print):
+             train_ctc=False, seed=0, align_cache=None, log=print):
     """Lipflow's speaker adaptation (train_vsr.finetune: AdamW, clip 5, BatchNorm frozen, its augmentation), and
     optionally: cut_p of the steps train on an unfinished read (cut()), a free CTC weight, time-stretch, a wider scope.
-    The defaults are Lipflow's recipe. Returns the state-dict prefixes it trained (what save() keeps)."""
+    The defaults are Lipflow's recipe (main() picks recipe C). With cut_p, clips need an 'id' to use align_cache (a
+    JSON path, see word_ends). Returns the state-dict prefixes it trained (what save() keeps)."""
     import random
     from lipflow.train_vsr import _augment, _targets
     random.seed(seed)
@@ -179,10 +237,15 @@ def finetune(clips, reader, epochs=6, lr=1e-4, ctc_weight=0.1, cut_p=0.0, speed_
     params, prefixes = scope_params(reader, extra_blocks, train_ctc)
     opt = torch.optim.AdamW(params, lr=lr, weight_decay=1e-4)
     data = []
+    aligned = load_alignments(align_cache) if cut_p else {}
+    n_aligned = len(aligned)
     for c in clips:
         ids = _targets(reader, c['text'])
-        word_of, ends = word_ends(reader, c['rois'], ids) if cut_p else (None, None)
+        word_of, ends = word_ends(reader, c['rois'], ids, c.get('id'), aligned) if cut_p else (None, None)
         data.append((c['rois'], ids, word_of, ends))
+    if align_cache and len(aligned) > n_aligned:
+        save_alignments(align_cache, aligned)
+        log(f'  aligned {len(aligned) - n_aligned} new clips ({len(aligned)} in {align_cache})')
     t0 = time.time()
     for ep in range(epochs):
         m.train()
@@ -224,15 +287,19 @@ def main(argv=None):
     ap.add_argument('--test-sessions', nargs='+', default=[], help='hold out these whole sessions and report')
     ap.add_argument('--epochs', type=int, default=6)
     ap.add_argument('--lr', type=float, default=1e-4)
-    ap.add_argument('--ctc-weight', type=float, default=0.1, help="CTC's share of the loss (Lipflow: 0.1)")
-    ap.add_argument('--cut-p', type=float, default=0.0,
+    ap.add_argument('--recipe', choices=sorted(RECIPES), default='c',
+                    help="c: --cut-p 0.5 --ctc-weight 0.5 --train-ctc --extra-blocks 2; lipflow: Lipflow's own "
+                         "(0, 0.1, off, 0). The four flags below override their part")
+    ap.add_argument('--ctc-weight', type=float, default=None, help="CTC's share of the loss")
+    ap.add_argument('--cut-p', type=float, default=None,
                     help='share of steps on an unfinished read: a random prefix, its finished words as target')
     ap.add_argument('--speed', type=float, default=0.0, help='time-stretch augmentation, rate in 1 +- this')
-    ap.add_argument('--extra-blocks', type=int, default=0, help='also train the last N Conformer blocks')
-    ap.add_argument('--train-ctc', action='store_true', help="also train the CTC head's projection")
+    ap.add_argument('--extra-blocks', type=int, default=None, help='also train the last N Conformer blocks')
+    ap.add_argument('--train-ctc', action=argparse.BooleanOptionalAction, default=None,
+                    help="also train the CTC head's projection")
     ap.add_argument('--seed', type=int, default=0)
     ap.add_argument('--out', default=DEFAULT_OUT)
-    ap.add_argument('--force', action='store_true', help='save even if the held-out final pass got worse')
+    ap.add_argument('--force', action='store_true', help='save even if the held-out seen WER got worse')
     args = ap.parse_args(argv)
     if any('session_03' in s for s in args.sessions):
         ap.error('session 3 is the test session: never train on it')
@@ -241,35 +308,46 @@ def main(argv=None):
 
     from lipflow.train_vsr import DEFAULT_SCOPE
     from lipflow.vsr import LipReader
-    from lipread.final import Beam
+    recipe = resolve_recipe(args.recipe, args.cut_p, args.ctc_weight, args.train_ctc, args.extra_blocks)
     face = os.path.join(lipread.LIPFLOW_MODELS, 'face_landmarker.task')
     train_rows, test_rows = split(sentence_clips(args.sessions), args.test_every)
     test_rows += sentence_clips(args.test_sessions)
     t0 = time.time()
-    train = [dict(rois=crops(r, face), text=r['prompt']) for r in train_rows]
-    test = [dict(rois=crops(r, face), text=r['prompt']) for r in test_rows]
+    train = [dict(rois=crops(r, face), text=r['prompt'], id=r['id']) for r in train_rows]
+    test = [dict(rois=crops(r, face), text=r['prompt'], id=r['id']) for r in test_rows]
     print(f'{len(train)} train clips from {", ".join(args.sessions)} / {len(test)} held out '
           f'({", ".join(args.test_sessions) or (f"every {args.test_every}th" if args.test_every else "none")}), crops in '
-          f'{time.time() - t0:.0f} s; scope {DEFAULT_SCOPE}, {args.epochs} epochs, lr {args.lr}', flush=True)
+          f'{time.time() - t0:.0f} s; scope {DEFAULT_SCOPE}, {args.epochs} epochs, lr {args.lr}, recipe {args.recipe} '
+          f'{recipe}', flush=True)
 
     reader = LipReader(personal=False)
-    beam = Beam(reader)
-    beam.encode = None
+    beam = aligner = None
     if test:
+        from lipread.final import Beam
+        from lipread.model import LiveModel
+        beam = Beam(reader)
+        beam.encode = None
+        aligner = LiveModel(warmup=(), face_adapter=None)
         before = score(reader, beam, test)
-        print(f'base:    tick WER {before[0]:.3f} (exact {before[2]}) | final WER {before[1]:.3f} (exact {before[3]})',
-              flush=True)
+        seen_before = streaming_seen(test, aligner)
+        print(f'base:    seen WER {seen_before["seen_wer"]:.3f} | tick WER {before[0]:.3f} (exact {before[2]}) | '
+              f'final WER {before[1]:.3f} (exact {before[3]})', flush=True)
     t0 = time.time()
-    prefixes = finetune(train, reader, epochs=args.epochs, lr=args.lr, ctc_weight=args.ctc_weight, cut_p=args.cut_p,
-                        speed_spread=args.speed, extra_blocks=args.extra_blocks, train_ctc=args.train_ctc,
-                        seed=args.seed, log=lambda s: print(s, flush=True))
+    prefixes = finetune(train, reader, epochs=args.epochs, lr=args.lr, speed_spread=args.speed, seed=args.seed,
+                        align_cache=ALIGN_CACHE, log=lambda s: print(s, flush=True), **recipe)
     print(f'trained in {time.time() - t0:.0f} s', flush=True)
     if test:
         after = score(reader, beam, test)
-        print(f'adapted: tick WER {after[0]:.3f} (exact {after[2]}) | final WER {after[1]:.3f} (exact {after[3]})',
-              flush=True)
-        if after[1] > before[1] and not args.force:
-            print('held-out final pass got worse: not saved (--force to save anyway)')
+        candidate = args.out + '.candidate'
+        save(reader, candidate, prefixes)
+        try:
+            seen_after = streaming_seen(test, aligner, candidate)
+        finally:
+            os.remove(candidate)
+        print(f'adapted: seen WER {seen_after["seen_wer"]:.3f} | tick WER {after[0]:.3f} (exact {after[2]}) | '
+              f'final WER {after[1]:.3f} (exact {after[3]})', flush=True)
+        if seen_after['seen_wer'] > seen_before['seen_wer'] and not args.force:
+            print('held-out seen WER got worse: not saved (--force to save anyway)')
             return 1
     n = save(reader, args.out, prefixes)
     print(f'saved {n} tensors to {args.out}  (lipread.run --face-adapter {args.out})')
