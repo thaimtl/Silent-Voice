@@ -422,6 +422,7 @@ def parse_args(argv=None):
                     help='gpu: rescoring on the tick thread at segment end (lipread/final.py GpuFinal); '
                          'cpu: beam 5 + LM in a background process (FinalPass)')
     ap.add_argument('--no-fe-cache', action='store_true', help='re-run the front end on the whole segment every tick')
+    ap.add_argument('--no-graphs', action='store_true', help='eager reads instead of one CUDA graph per length')
     return ap.parse_args(argv)
 
 
@@ -458,7 +459,7 @@ def main(argv=None):
                 target=lambda: box.update(final=FinalPass(None, pub.send, face_adapter=args.face_adapter)),
                 name='final-start', daemon=True)
             starter.start()
-        model = LiveModel(half=not args.fp32, face_adapter=args.face_adapter)
+        model = LiveModel(half=not args.fp32, face_adapter=args.face_adapter, graphs=False if args.no_graphs else None)
         log.info('model ready (warm-up %.1f s%s)', model.warmup_s,
                  f', face adapter {args.face_adapter}' if args.face_adapter else '')
         if cpu_final:
