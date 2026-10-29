@@ -8,7 +8,8 @@ import itertools
 import numpy as np
 import pytest
 
-from lipread.rescore import LOG0, attention_scores_multi, combined, ctc_prefix_beam, lm_scores
+from lipread.rescore import (LOG0, attention_beam, attention_scores_multi, combined, ctc_prefix_beam, ctc_scores,
+                             lm_scores)
 
 from .conftest import needs_cuda, needs_weights
 
@@ -40,6 +41,20 @@ def test_prefix_beam_with_a_wide_beam_is_exact_ctc():
     assert len(got) == len(want)
     for seq, score in got:
         assert score == pytest.approx(want[seq], abs=1e-9)
+
+
+def test_ctc_scores_are_exact_ctc_and_minus_inf_when_too_long():
+    import torch
+    from types import SimpleNamespace
+    rng = np.random.default_rng(1)
+    logits = rng.normal(size=(5, 4))
+    logp = logits - np.logaddexp.reduce(logits, axis=1, keepdims=True)
+    model = SimpleNamespace(ctc=SimpleNamespace(log_softmax=lambda x: torch.tensor(logp)[None]))
+    want = exact_ctc(logp)
+    hyps = [(), (1,), (2, 3), (1, 1), (3, 2, 1), (1, 1, 1)]
+    got = ctc_scores(model, torch.zeros(5, 2), hyps)
+    assert np.allclose(got, [want[h] for h in hyps], atol=1e-6)
+    assert ctc_scores(model, torch.zeros(5, 2), [(1, 1, 1, 1)])[0] == -np.inf     # 1 _ 1 _ 1 _ 1 needs 7 frames
 
 
 def test_a_repeated_label_needs_a_blank_between():
@@ -97,3 +112,20 @@ def test_a_batch_scores_each_hypothesis_as_alone(reader):
     batch = lm_scores(lm, hyps, m.eos)
     alone = [lm_scores(lm, [[h]], m.eos)[0][0] for hs in hyps for h in hs]
     assert np.allclose(np.concatenate(batch), alone, atol=1e-4)
+
+
+@needs_cuda
+@needs_weights
+def test_attention_beam_finds_what_espnets_beam_finds_on_the_sample(sample_video, face_model):
+    """The batched attention beam (no CTC, no LM) against ESPnet's beam search with the same weights: same best."""
+    from lipread.final import Beam
+    from lipread.model import LiveModel
+    from .test_final import sample_rois
+    x = sample_rois(sample_video, face_model)
+    model = LiveModel(warmup=())
+    enc = model.encode(x)
+    ours = attention_beam(model, enc, beam=5)
+    theirs = Beam(model, lm_weight=0.0, ctc_weight=0.0)(enc=enc)
+    tok = model.token_list
+    from bus import bus_text
+    assert bus_text(''.join(tok[i] for i in ours[0])) == theirs[0][0]

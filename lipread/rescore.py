@@ -1,7 +1,8 @@
 """Rescoring a CTC read: a CTC prefix beam over the read's top-k, its n-best rescored by the attention decoder in one
 batched teacher-forced pass (the two-pass decoding of U2, https://arxiv.org/abs/2012.05481) and by Auto-AVSR's
-Transformer LM, as lipread/streaming_eval.py scores it offline. Nothing live runs it: every tick it cost +26 ms on
-the 5090 (beam 14 ms on the CPU, decoder 5, LM 5).
+Transformer LM, as lipread/streaming_eval.py scores it offline; plus a batched attention-decoder beam and exact CTC
+scores, which lipread/final.py's GPU final pass adds at segment end. No tick runs it: every tick it cost +26 ms on the
+5090 (beam 14 ms on the CPU, decoder 5, LM 5).
 """
 import numpy as np
 import torch
@@ -107,3 +108,73 @@ def combined(hyps, ctc, att, lm, w_ctc, w_lm=0.0, bonus=0.0):
     if w_lm:
         score = score + w_lm * lm
     return score
+
+
+@torch.inference_mode()
+def ctc_scores(model, enc, hyps):
+    """Exact CTC log-prob of each hypothesis (token tuples) given enc (T, D), from the model's CTC head; -inf when it
+    can't fit in T frames."""
+    logp = model.ctc.log_softmax(enc.float().unsqueeze(0))[0]                # (T, V)
+    n = len(hyps)
+    lens = torch.tensor([len(h) for h in hyps], dtype=torch.long)
+    targets = torch.zeros((n, max(1, int(lens.max()))), dtype=torch.long)
+    for j, h in enumerate(hyps):
+        if h:
+            targets[j, :len(h)] = torch.tensor(h)
+    nll = torch.nn.functional.ctc_loss(
+        logp.unsqueeze(1).expand(-1, n, -1), targets.to(logp.device), torch.full((n,), len(logp), dtype=torch.long),
+        lens, blank=0, reduction='none', zero_infinity=False)
+    return (-nll).cpu().numpy().astype(np.float64)
+
+
+@torch.inference_mode()
+def attention_beam(model, enc, beam=5, lm=None, lm_weight=0.0, att_weight=1.0, maxlen=None):
+    """Batched beam search with the attention decoder (+ lm_weight x LM) and their key/value caches, no CTC: the
+    hypotheses the decoder itself would write, for rescoring. -> [token tuples], best first (eos dropped).
+    maxlen: most tokens per hypothesis (default T)."""
+    from espnet.nets.pytorch_backend.transformer.mask import subsequent_mask
+    m = model.reader.model
+    dec, eos = m.decoder, m.eos
+    for module in dec.modules():
+        if hasattr(module, '_mem_kv'):
+            del module._mem_kv
+    dev = next(dec.parameters()).device
+    mem = enc.float().to(dev).unsqueeze(0)
+    maxlen = maxlen or len(enc)
+    ys = torch.full((1, 1), eos, dtype=torch.long, device=dev)
+    score = torch.zeros(1, device=dev)
+    dcache = lcache = None
+    done = []
+    for step in range(maxlen + 1):
+        n = len(ys)
+        att, dcache = dec.forward_one_step(ys, subsequent_mask(ys.size(1), device=dev).unsqueeze(0),
+                                           mem.expand(n, -1, -1), cache=dcache)
+        tot = score[:, None] + att_weight * att
+        if lm is not None and lm_weight:
+            emb = lm.embed(ys) if lm.embed_drop is None else lm.embed_drop(lm.embed(ys))
+            h, _, lcache = lm.encoder.forward_one_step(emb, lm._target_mask(ys), cache=lcache)
+            tot = tot + lm_weight * lm.decoder(h[:, -1]).log_softmax(-1)
+        tot[:, 0] = -float('inf')                               # the CTC blank is no token to write
+        if step == maxlen:                                      # only eos left
+            tot[:, :eos] = -float('inf')
+        V = tot.size(1)
+        best = tot.view(-1).topk(min(beam, tot.numel()))
+        src, tok = (best.indices // V).tolist(), (best.indices % V).tolist()
+        vals = best.values.tolist()
+        keep = []
+        prefixes = ys.tolist()
+        for s, t, v in zip(src, tok, vals):
+            if t == eos:
+                done.append((v, tuple(prefixes[s][1:])))
+            else:
+                keep.append((s, t, v))
+        done.sort(key=lambda d: -d[0])
+        if not keep or (len(done) >= beam and keep[0][2] < done[beam - 1][0]):
+            break
+        idx = torch.tensor([s for s, _, _ in keep], device=dev)
+        ys = torch.cat([ys[idx], torch.tensor([[t] for _, t, _ in keep], device=dev)], dim=1)
+        score = torch.tensor([v for _, _, v in keep], device=dev)
+        dcache = [c[idx] for c in dcache]
+        if lcache is not None:
+            lcache = [c[idx] for c in lcache]
+    return [h for _, h in done[:beam]]

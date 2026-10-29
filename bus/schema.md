@@ -79,13 +79,14 @@ at 10 ticks/s: twice the v1 message rate and bandwidth, still trivial on loopbac
 
 ## `cam.final`
 
-Sent once per segment, about 1.1 s or more after the segment ends (beam 5 + LM runs in the background). It is also
-sent for a segment closed by the 8 s cap.
+Sent once per segment, with the segment's closing read: the camera reader rescores it on the GPU on the tick thread
+(`lipread.run --final gpu`, about 50 ms on the 5090). With `--final cpu` it comes about 1.1 s or more after the segment
+ends (beam 5 + LM in a background process). It is also sent for a segment closed by the 8 s cap.
 
 | Field | Type | Meaning |
 | --- | --- | --- |
 | `v`, `seq`, `t_pub`, `seg_id` | | as in `cam.tick` |
-| `nbest` | list of {`text`, `score`} | up to 5, best first; text UPPERCASE; score = log-prob, where higher is better |
+| `nbest` | list of {`text`, `score`} | up to 5, best first; text UPPERCASE; score = 0.9 attention + 0.1 CTC + 0.3 LM log-prob, where higher is better |
 
 ## `cam.face`
 

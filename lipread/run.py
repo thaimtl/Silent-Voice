@@ -418,6 +418,9 @@ def parse_args(argv=None):
     ap.add_argument('--no-pose', action='store_true',
                     help='no head pose in cam.face (+0.02 ms/frame at 1280x720 on the dev box, so on by default)')
     ap.add_argument('--no-final', action='store_true', help='no cam.final (E6 beam + LM at segment end)')
+    ap.add_argument('--final', choices=('gpu', 'cpu'), default='gpu',
+                    help='gpu: rescoring on the tick thread at segment end (lipread/final.py GpuFinal); '
+                         'cpu: beam 5 + LM in a background process (FinalPass)')
     ap.add_argument('--no-fe-cache', action='store_true', help='re-run the front end on the whole segment every tick')
     return ap.parse_args(argv)
 
@@ -448,15 +451,17 @@ def main(argv=None):
     code = 1
     try:
         box = {}
-        if not args.no_final:
+        cpu_final = not args.no_final and args.final == 'cpu'
+        if cpu_final:
             from lipread.final import FinalPass
-            starter = threading.Thread(target=lambda: box.update(final=FinalPass(None, pub.send, face_adapter=args.face_adapter)), name='final-start',
-                                       daemon=True)
+            starter = threading.Thread(
+                target=lambda: box.update(final=FinalPass(None, pub.send, face_adapter=args.face_adapter)),
+                name='final-start', daemon=True)
             starter.start()
         model = LiveModel(half=not args.fp32, face_adapter=args.face_adapter)
         log.info('model ready (warm-up %.1f s%s)', model.warmup_s,
                  f', face adapter {args.face_adapter}' if args.face_adapter else '')
-        if not args.no_final:
+        if cpu_final:
             starter.join()
             final = box.get('final')
             if final is None:
@@ -464,6 +469,10 @@ def main(argv=None):
             else:
                 final.beam.model = model
                 log.info('final pass ready (beam 5 + LM, background process)')
+        elif not args.no_final:
+            from lipread.final import GpuFinal
+            final = GpuFinal(model, pub.send)
+            log.info('final pass ready (GPU rescoring on the tick thread)')
         source = make_source(args)
         cropper = LiveCropper(os.path.join(lipread.LIPFLOW_MODELS, 'face_landmarker.task'), pose=not args.no_pose)
         segmenter = Segmenter() if args.segments == 'auto' else Segmenter.stream()
@@ -524,8 +533,6 @@ def main(argv=None):
         if logf:
             logf.close()
     print(summary(runner.stats))
-    if getattr(source, 'fps_now', None) is not None:
-        print(f'camera delivered {source.fps_now:.1f} fps (rolling 5 s window at the end)')
     if torch.cuda.is_available():
         print(f'peak GPU memory {torch.cuda.max_memory_allocated() / 2 ** 20:.0f} MiB')
     return code

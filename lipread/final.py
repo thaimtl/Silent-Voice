@@ -1,14 +1,29 @@
-"""Final pass (E6): when a segment closes ('end' or the 8 s 'cap'), Auto-AVSR's beam search with the subword LM
-(beam 5, LM weight 0.3 as Lipflow) re-reads the whole segment in the background -> cam.final with the 5 best.
+"""Final pass (E6): when a segment closes ('end' or the 8 s 'cap'), the whole segment is decoded once more with the
+attention decoder and the subword LM -> cam.final with the 5 best. Two ways, chosen with lipread.run --final:
 
-    final = FinalPass(model, pub.send)          # model: the LiveModel the tick loop uses; ~25 s start (process)
+gpu (default): GpuFinal rescores on the tick thread, right after the closing read, on the encoder output that read
+already has (Rescore): hypotheses from a CTC prefix beam over the live model's CTC top-k and from a batched
+attention-decoder beam, each scored by exact CTC, the attention decoder and the LM in one batched pass, combined
+0.9 attention + 0.1 CTC + 0.3 LM like the beam. It uses the live model's CTC head and decoder, so a face adapter that
+trains the CTC head (recipe C) is honoured. cam.final goes out with the closing tick instead of 0.5 to 1.5 s later.
+Measured (5090, data/avsr_experiments/rt/final_compare.py): WER of the best 0.175 vs the CPU beam's 0.191 on session 2
+(adapter s1only), ~50 ms per segment. A worker thread instead took the tick read from p50 12 to 51 ms (GIL).
+
+    final = GpuFinal(model, pub.send)           # model: the LiveModel the tick loop uses (loads the LM on its GPU)
+    final.submit(seg.seg_id, rois, enc=r.enc)   # rescores and publishes before it returns
+    final.close()
+
+cpu: Auto-AVSR's beam search with the subword LM (beam 5, LM weight 0.3 as Lipflow) in the background:
+
+    final = FinalPass(model, pub.send, face_adapter=path)   # ~25 s start (process)
     final.submit(seg.seg_id, rois, enc=r.enc)   # returns at once; enc: the last tick's encoder output (no re-encode)
     ...
     final.close(timeout=3.0)                    # finish what is queued within the timeout, drop the rest
 
 One worker thread hands the segments over one after another to a spawned process (RemoteBeam): the beam runs there on
-the CPU (4 torch threads, lower priority) with a LipReader whose encoder is deleted (decoder + CTC head + LM); only the
-encoder output crosses. No VRAM, no second CUDA context, and no GIL shared with the tick loop. A beam in a thread of
+the CPU (4 torch threads, lower priority) with a LipReader whose encoder is deleted (decoder + CTC head + LM, the face
+adapter's CTC head loaded over the base one); only the encoder output crosses. No VRAM, no second CUDA context, and
+no GIL shared with the tick loop. A beam in a thread of
 this process was measured and dropped (CHANGELOG E6, 5090, noisy shared box): it took the tick (LiveModel.read) from
 p50 15 / p95 27 ms to 52 / 69 ms (GIL: the tick is launch-bound Python); in the CPU process, 13 / 24 -> 18 / 32.
 Beam (the search itself) still runs in-process for the process child and as the GPU reference in the tests.
@@ -21,8 +36,8 @@ Queue policy: one beam running, at most max_pending (2) waiting. A segment closi
 OLDEST waiting one (logged, seg_id in .dropped): the newest segment is what is on screen, an older one already has its
 live text from cam.tick. 2 waiting covers a capped 8 s segment, its continuation and one more before anything drops.
 
-Scores: the beam's total weighted log-prob (0.9 decoder + 0.1 CTC + 0.3 LM), higher = better, best first, one entry
-per distinct text. A segment with no hypothesis sends (('', score),).
+Scores (both ways): the total weighted log-prob (0.9 decoder + 0.1 CTC + 0.3 LM), higher = better, best first, one
+entry per distinct text. A segment with no hypothesis sends (('', score),).
 """
 import collections
 import logging
@@ -39,11 +54,14 @@ import torch
 
 import lipread  # noqa: F401  (puts Lipflow on sys.path)
 from bus import CamFinal, bus_text, now
+from lipread.rescore import (LOG0, attention_beam, attention_scores_multi, combined, ctc_prefix_beam, ctc_scores,
+                             lm_scores)
 
 log = logging.getLogger('lipread.final')
 BEAM, NBEST = 5, 5
 LM_WEIGHT, CTC_WEIGHT = 0.3, 0.1
 MAX_PENDING = 2
+PREFIX_BEAM, PER_FRAME, ATT_BEAM = 8, 8, 5
 
 
 class Beam:
@@ -120,30 +138,19 @@ def lower_priority(nice):
         kernel32.SetPriorityClass(kernel32.GetCurrentProcess(), 0x4000)
 
 
-def load_ctc_head(model, path):
-    """The CTC head's tensors (ctc.*) of a face adapter trained with --train-ctc, over model's; any other tensor in
-    the file is ignored (the encoder is not in this process). Returns the tensor count."""
-    state = torch.load(path, map_location='cpu', weights_only=True)
-    ctc = {k: v for k, v in state.items() if k.startswith('ctc.')}
-    if ctc:
-        model.load_state_dict(ctc, strict=False)
-    return len(ctc)
-
-
-def _child(jobs, results, kw, device, threads, nice):
-    """RemoteBeam's process: a LipReader without its encoder (decoder + CTC head + LM, on device) beams the encoder
-    outputs it is sent. jobs: enc (T, D) float32, None stops -> results (nbest or error text, beam_ms).
-    kw['face_adapter']: the adapter the encoder runs, whose CTC head (if trained) the beam must use."""
-    kw = dict(kw)
-    adapter = kw.pop('face_adapter', None)
+def _child(jobs, results, kw, device, threads, nice, face_adapter=None):
+    """RemoteBeam's process: a LipReader without its encoder (decoder + CTC head + LM, on device; the face adapter's
+    CTC head if it has one) beams the encoder outputs it is sent. jobs: enc (T, D) float32, None stops -> results
+    (nbest or error text, beam_ms)."""
     signal.signal(signal.SIGINT, signal.SIG_IGN)
     torch.set_num_threads(threads)
     lower_priority(nice)
     from lipflow.vsr import LipReader
     reader = LipReader(device=device, use_lm=kw['lm_weight'] > 0, lm_weight=kw['lm_weight'],
                        ctc_weight=kw['ctc_weight'], personal=False)
-    if adapter:
-        load_ctc_head(reader.model, adapter)
+    if face_adapter:
+        from lipread.model import load_face_adapter
+        load_face_adapter(reader.model, face_adapter)
     del reader.model.encoder
     if reader.device.type == 'cuda':
         torch.cuda.empty_cache()
@@ -165,15 +172,15 @@ class RemoteBeam:
     """Beam's interface, the search run in a spawned process (no GIL shared with the tick loop). Only the encoder output
     crosses (T x 768 float32, 0.6 MB at 8 s); rois without enc are encoded here first with model (the shared LiveModel).
     device 'cpu' (default): no VRAM and no CUDA context; measured about as fast as the GPU at threads=4.
+    face_adapter: the live model's adapter file, whose CTC head (recipe C, --train-ctc) the child loads.
     target: the child's function (tests swap in a fake one)."""
 
     def __init__(self, model=None, beam_size=BEAM, nbest=NBEST, lm_weight=LM_WEIGHT, ctc_weight=CTC_WEIGHT,
                  device='cpu', threads=4, nice=10, start_timeout=120, target=_child, face_adapter=None):
         self.model = model
         self.ctx = mp.get_context('spawn')
-        kw = dict(beam_size=beam_size, nbest=nbest, lm_weight=lm_weight, ctc_weight=ctc_weight,
-                  face_adapter=face_adapter)
-        self.args = (kw, device, threads, nice)
+        kw = dict(beam_size=beam_size, nbest=nbest, lm_weight=lm_weight, ctc_weight=ctc_weight)
+        self.args = (kw, device, threads, nice, face_adapter)
         self.device, self.threads, self.start_timeout, self.target = device, threads, start_timeout, target
         self.proc = None
         self.restarts = 0
@@ -327,3 +334,108 @@ class FinalPass:
         if not done:
             log.warning('final pass still running a beam after %.1f s', timeout)
         return done
+
+
+class Rescore:
+    """The final pass on the live model's GPU: (rois, enc) -> ((text, score), ...), best first, as Beam returns it.
+
+    Hypotheses: a CTC prefix beam (beam, per_frame) over the CTC top-k of enc from the live model's CTC head, and a
+    batched attention-decoder beam (att_beam, with search_lm x LM; lipread/rescore.py attention_beam). The LM in the
+    search (search_lm 0.3) cost ~50 ms more per segment on the 5090 for no better WER, so it is off by default. Every
+    hypothesis is scored by exact CTC, the attention decoder and the LM in one batched pass each, then combined as the
+    beam weighs them: ctc_weight x CTC + (1 - ctc_weight) x attention + lm_weight x LM + bonus x tokens."""
+
+    def __init__(self, model, beam=PREFIX_BEAM, per_frame=PER_FRAME, att_beam=ATT_BEAM, search_lm=0.0,
+                 nbest=NBEST, lm_weight=LM_WEIGHT, ctc_weight=CTC_WEIGHT, bonus=0.0):
+        self.model = model
+        self.beam, self.per_frame, self.att_beam, self.nbest = beam, per_frame, att_beam, nbest
+        self.search_lm = search_lm
+        self.lm_weight, self.ctc_weight, self.bonus = lm_weight, ctc_weight, bonus
+        self.eos = model.reader.model.eos
+        dev = next(model.reader.model.decoder.parameters()).device
+        self.lm = load_lm(len(model.token_list)).to(dev) if lm_weight or search_lm else None
+        self(enc=torch.zeros((25, model.reader.model.adim), device=dev))
+
+    @torch.inference_mode()
+    def prefix_hypotheses(self, enc):
+        m = self.model
+        logp = m.ctc.log_softmax(enc.float().unsqueeze(0))[0]
+        top = logp.topk(self.per_frame, dim=-1)
+        out = torch.cat([top.values, logp[:, :1], top.indices.float()], dim=1).cpu().numpy()
+        k = self.per_frame
+        return [h for h, s in ctc_prefix_beam(out[:, k + 1:].astype(np.int64), out[:, :k], out[:, k], self.beam,
+                                              self.per_frame) if s > LOG0 / 2]
+
+    @torch.inference_mode()
+    def hypotheses(self, enc):
+        """enc (T, D) -> (token tuples, CTC, attention, LM or None): both beams' hypotheses and their scores."""
+        m = self.model
+        enc = torch.as_tensor(enc).to(m.device)
+        hyps = self.prefix_hypotheses(enc) if self.beam else []
+        if self.att_beam:
+            hyps += attention_beam(m, enc, self.att_beam, self.lm, self.search_lm, 1.0 - self.ctc_weight)
+        hyps = list(dict.fromkeys(hyps))
+        ctc = ctc_scores(m, enc, hyps)
+        ok = np.isfinite(ctc)
+        hyps, ctc = [h for h, k in zip(hyps, ok) if k], ctc[ok]
+        if not hyps:
+            return [()], np.zeros(1), np.zeros(1), None if self.lm is None else np.zeros(1)
+        att = attention_scores_multi(m, enc.unsqueeze(0), [hyps])[0]
+        lm = lm_scores(self.lm, [hyps], self.eos)[0] if self.lm is not None else None
+        return hyps, ctc, att, lm
+
+    def __call__(self, rois=None, enc=None):
+        if enc is None:
+            if rois is None or len(rois) == 0:
+                return (('', 0.0),)
+            enc = self.model.encode(rois)
+        elif len(enc) == 0:
+            return (('', 0.0),)
+        hyps, ctc, att, lm = self.hypotheses(enc)
+        score = combined(hyps, ctc, att, lm, self.ctc_weight, self.lm_weight, self.bonus)
+        out, seen = [], set()
+        for j in np.argsort(-score, kind='stable'):
+            text = bus_text(''.join(self.model.token_list[i] for i in hyps[j]))
+            if text not in seen:
+                seen.add(text)
+                out.append((text, float(score[j])))
+            if len(out) == self.nbest:
+                break
+        return tuple(out)
+
+
+class GpuFinal:
+    """FinalPass's interface, rescored on the caller's thread (the tick loop, right after the closing read): submit()
+    publishes the segment's CamFinal before it returns. A worker thread would share the GIL with the launch-bound
+    tick; one rescoring costs a few ms per segment instead.
+
+    rescore: a callable (rois, enc) -> ((text, score), ...); default Rescore(model).
+    stats: per published segment dict(seg_id, T, beam_ms, queued_ms=0); .dropped stays empty; .errors: seg_ids whose
+    rescoring raised (logged, nothing sent)."""
+
+    def __init__(self, model, publish, rescore=None, **kw):
+        self.rescore = rescore if rescore is not None else Rescore(model, **kw)
+        self.publish = publish
+        self.closing = False
+        self.stats, self.dropped, self.errors = [], [], []
+
+    def submit(self, seg_id, rois, enc=None):
+        if self.closing:
+            return False
+        t0 = time.perf_counter()
+        try:
+            nbest = self.rescore(rois, enc)
+            self.publish(CamFinal(seg_id, tuple(nbest)))
+            self.stats.append(dict(seg_id=seg_id, T=len(rois) if rois is not None else len(enc),
+                                   beam_ms=(time.perf_counter() - t0) * 1000, queued_ms=0.0))
+        except Exception:  # noqa: BLE001
+            self.errors.append(seg_id)
+            log.exception('final pass failed on segment %d', seg_id)
+        return True
+
+    def wait_idle(self, timeout=None):
+        return True
+
+    def close(self, timeout=3.0):
+        self.closing = True
+        return True
