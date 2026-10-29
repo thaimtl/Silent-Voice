@@ -54,14 +54,16 @@ class FrontendCache:
 
 
 FACE_ADAPTER_PREFIXES = ('encoder.frontend.', 'encoder.embed.', 'encoder.encoders.0.')
+ADAPTER_ALLOWED = ('encoder.', 'ctc.ctc_lo.')     # what an adapter may change (lipread/adapt.py --extra-blocks/--train-ctc)
 
 
 def load_face_adapter(model, path):
     """Lipflow's face adapter (lipread/adapt.py, as lipflow/train_vsr.py): new values for the front end, the embed and
-    Conformer block 0, loaded over the base weights. Same shapes, so a read costs the same. Returns the tensor count;
-    ValueError for a file with any other tensor, which would silently change the rest of the model."""
+    Conformer block 0 (a wider adapter: more encoder blocks and the CTC head's projection), loaded over the base
+    weights. Same shapes, so a read costs the same. Returns the tensor count; ValueError for a file with any other
+    tensor (the decoder), which would silently change the rest of the model."""
     state = torch.load(path, map_location='cpu', weights_only=True)
-    other = sorted(k for k in state if not k.startswith(FACE_ADAPTER_PREFIXES))
+    other = sorted(k for k in state if not k.startswith(ADAPTER_ALLOWED))
     if other:
         raise ValueError(f'{path}: not a face adapter, {len(other)} other tensors (first: {other[0]})')
     res = model.load_state_dict(state, strict=False)

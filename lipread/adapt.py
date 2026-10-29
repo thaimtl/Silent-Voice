@@ -97,8 +97,121 @@ def score(reader, beam, clips):
             sum(a == b for a, b in zip(ref, final)))
 
 
-def save(reader, path):
-    state = {k: v.detach().cpu() for k, v in reader.model.state_dict().items() if k.startswith(FACE_ADAPTER_PREFIXES)}
+def scope_params(reader, extra_blocks=0, train_ctc=False):
+    """Lipflow's scope (front end, embed, Conformer block 0), plus the last extra_blocks Conformer blocks and the CTC
+    head's projection: (parameters, state-dict prefixes). Everything else is frozen."""
+    from lipflow.train_vsr import DEFAULT_SCOPE, trainable
+    params = trainable(reader, DEFAULT_SCOPE)
+    prefixes = list(FACE_ADAPTER_PREFIXES)
+    m = reader.model
+    n = len(m.encoder.encoders)
+    for i in range(max(1, n - extra_blocks), n):
+        params += list(m.encoder.encoders[i].parameters())
+        prefixes.append(f'encoder.encoders.{i}.')
+    if train_ctc:
+        params += list(m.ctc.ctc_lo.parameters())
+        prefixes.append('ctc.ctc_lo.')
+    for p in params:
+        p.requires_grad_(True)
+    return params, tuple(prefixes)
+
+
+def word_ends(reader, rois, ids):
+    """Frame after each true word's last frame, by CTC forced alignment on a whole-clip read (lipread.streaming_eval)."""
+    from lipread.streaming_eval import forced_align, token_words, word_spans
+    with torch.inference_mode():
+        x = reader.to_tensor(rois).unsqueeze(0).to(reader.enc_device)
+        enc, _ = reader.model.encoder(x, None)
+        logp = reader.model.ctc.log_softmax(enc)[0].float().cpu().numpy()
+    word_of, words = token_words(reader, ids)
+    _, ends = word_spans(forced_align(logp, ids), word_of, len(words))
+    return word_of, ends
+
+
+def cut(rois, ids, word_of, ends, rng, min_frac=0.4):
+    """A random unfinished read of the clip, as a tick sees it: the first p frames (p from min_frac of the clip up), and
+    as target the words already finished by frame p. None when no word is finished yet."""
+    T = len(rois)
+    p = int(rng.integers(max(1, int(min_frac * T)), T + 1))
+    done = [u for u, w in enumerate(word_of) if ends[w] <= p]
+    return (rois[:p], [ids[u] for u in done]) if done else None
+
+
+def speed(rois, rng, spread):
+    """Time-stretched clip (frames repeated or dropped), rate in 1 +- spread."""
+    if not spread:
+        return rois
+    rate = rng.uniform(1 - spread, 1 + spread)
+    idx = np.round(np.arange(0, len(rois) - 1e-6, rate)).astype(int)
+    return rois[np.clip(idx, 0, len(rois) - 1)]
+
+
+def clip_loss(reader, x, ys, ctc_weight):
+    """Auto-AVSR's own loss, ctc_weight x CTC + (1 - ctc_weight) x attention (label-smoothed), per token: lipflow's
+    clip_loss with the weight free (0.1 there)."""
+    import torch.nn.functional as F
+    from espnet.nets.pytorch_backend.transformer.mask import subsequent_mask
+    m, dev = reader.model, reader.enc_device
+    hs, _ = m.encoder(x.unsqueeze(0).to(dev), None)
+    logp = m.ctc.ctc_lo(hs).log_softmax(-1).transpose(0, 1)
+    y = torch.tensor(ys, dtype=torch.long, device=dev)
+    ctc = F.ctc_loss(logp.float(), y.unsqueeze(0), torch.tensor([logp.shape[0]]), torch.tensor([len(ys)]), blank=0,
+                     reduction='sum', zero_infinity=True)
+    ys_in = torch.tensor([[m.eos] + ys], dtype=torch.long, device=dev)
+    ys_out = torch.tensor([ys + [m.eos]], dtype=torch.long, device=dev)
+    pred, _ = m.decoder(ys_in, subsequent_mask(ys_in.shape[1], device=dev).unsqueeze(0), hs, None)
+    return (ctc_weight * ctc + (1 - ctc_weight) * m.criterion(pred, ys_out)) / len(ys)
+
+
+def finetune(clips, reader, epochs=6, lr=1e-4, ctc_weight=0.1, cut_p=0.0, speed_spread=0.0, extra_blocks=0,
+             train_ctc=False, seed=0, log=print):
+    """Lipflow's speaker adaptation (train_vsr.finetune: AdamW, clip 5, BatchNorm frozen, its augmentation), and
+    optionally: cut_p of the steps train on an unfinished read (cut()), a free CTC weight, time-stretch, a wider scope.
+    The defaults are Lipflow's recipe. Returns the state-dict prefixes it trained (what save() keeps)."""
+    import random
+    from lipflow.train_vsr import _augment, _targets
+    random.seed(seed)
+    torch.manual_seed(seed)
+    rng = np.random.default_rng(seed)
+    m = reader.model
+    m.decoder.to(reader.enc_device)
+    m.ctc.to(reader.enc_device)
+    params, prefixes = scope_params(reader, extra_blocks, train_ctc)
+    opt = torch.optim.AdamW(params, lr=lr, weight_decay=1e-4)
+    data = []
+    for c in clips:
+        ids = _targets(reader, c['text'])
+        word_of, ends = word_ends(reader, c['rois'], ids) if cut_p else (None, None)
+        data.append((c['rois'], ids, word_of, ends))
+    t0 = time.time()
+    for ep in range(epochs):
+        m.train()
+        for mod in m.modules():
+            if isinstance(mod, (torch.nn.BatchNorm1d, torch.nn.BatchNorm2d, torch.nn.BatchNorm3d)):
+                mod.eval()
+        random.shuffle(data)
+        total = 0.0
+        for rois, ids, word_of, ends in data:
+            ys = ids
+            if cut_p and rng.random() < cut_p:
+                part = cut(rois, ids, word_of, ends, rng)
+                if part is not None:
+                    rois, ys = part
+            loss = clip_loss(reader, _augment(speed(rois, rng, speed_spread)), ys, ctc_weight)
+            opt.zero_grad()
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(params, 5.0)
+            opt.step()
+            total += float(loss.detach())
+        log(f'  epoch {ep + 1}/{epochs}: loss {total / len(data):.3f}  ({time.time() - t0:.0f}s)')
+    m.eval()
+    for p in m.parameters():
+        p.requires_grad_(False)
+    return prefixes
+
+
+def save(reader, path, prefixes=FACE_ADAPTER_PREFIXES):
+    state = {k: v.detach().cpu() for k, v in reader.model.state_dict().items() if k.startswith(tuple(prefixes))}
     os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
     torch.save(state, path)
     return len(state)
@@ -111,6 +224,13 @@ def main(argv=None):
     ap.add_argument('--test-sessions', nargs='+', default=[], help='hold out these whole sessions and report')
     ap.add_argument('--epochs', type=int, default=6)
     ap.add_argument('--lr', type=float, default=1e-4)
+    ap.add_argument('--ctc-weight', type=float, default=0.1, help="CTC's share of the loss (Lipflow: 0.1)")
+    ap.add_argument('--cut-p', type=float, default=0.0,
+                    help='share of steps on an unfinished read: a random prefix, its finished words as target')
+    ap.add_argument('--speed', type=float, default=0.0, help='time-stretch augmentation, rate in 1 +- this')
+    ap.add_argument('--extra-blocks', type=int, default=0, help='also train the last N Conformer blocks')
+    ap.add_argument('--train-ctc', action='store_true', help="also train the CTC head's projection")
+    ap.add_argument('--seed', type=int, default=0)
     ap.add_argument('--out', default=DEFAULT_OUT)
     ap.add_argument('--force', action='store_true', help='save even if the held-out final pass got worse')
     args = ap.parse_args(argv)
@@ -119,7 +239,7 @@ def main(argv=None):
     if set(args.sessions) & set(args.test_sessions):
         ap.error('a session cannot be both trained on and held out')
 
-    from lipflow.train_vsr import DEFAULT_SCOPE, finetune
+    from lipflow.train_vsr import DEFAULT_SCOPE
     from lipflow.vsr import LipReader
     from lipread.final import Beam
     face = os.path.join(lipread.LIPFLOW_MODELS, 'face_landmarker.task')
@@ -140,7 +260,9 @@ def main(argv=None):
         print(f'base:    tick WER {before[0]:.3f} (exact {before[2]}) | final WER {before[1]:.3f} (exact {before[3]})',
               flush=True)
     t0 = time.time()
-    finetune(train, epochs=args.epochs, lr=args.lr, reader=reader, log=lambda s: print(s, flush=True))
+    prefixes = finetune(train, reader, epochs=args.epochs, lr=args.lr, ctc_weight=args.ctc_weight, cut_p=args.cut_p,
+                        speed_spread=args.speed, extra_blocks=args.extra_blocks, train_ctc=args.train_ctc,
+                        seed=args.seed, log=lambda s: print(s, flush=True))
     print(f'trained in {time.time() - t0:.0f} s', flush=True)
     if test:
         after = score(reader, beam, test)
@@ -149,7 +271,7 @@ def main(argv=None):
         if after[1] > before[1] and not args.force:
             print('held-out final pass got worse: not saved (--force to save anyway)')
             return 1
-    n = save(reader, args.out)
+    n = save(reader, args.out, prefixes)
     print(f'saved {n} tensors to {args.out}  (lipread.run --face-adapter {args.out})')
     return 0
 
