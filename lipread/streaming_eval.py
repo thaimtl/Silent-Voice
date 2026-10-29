@@ -226,7 +226,7 @@ def truth(reader, aligner, clips, cache_path=None):
     """Per clip (words, starts, ends): the true words and their frame spans from the aligner's whole-clip read.
     cache_path: a JSON file keyed by clip id (the aligner is part of the caller's file name)."""
     cached = load_alignments(cache_path)
-    out = []
+    out, aligned = [], 0
     for c in clips:
         ids = tokenize(reader, c['text'])
         word_of, words = token_words(reader, ids)
@@ -237,8 +237,9 @@ def truth(reader, aligner, clips, cache_path=None):
                 logp = aligner.ctc.log_softmax(enc.float().unsqueeze(0))[0].cpu().numpy()
             starts, ends = word_spans(forced_align(logp, ids), word_of, len(words))
             hit = cached[c['id']] = dict(words=words, starts=[int(x) for x in starts], ends=[int(x) for x in ends])
+            aligned += 1
         out.append((hit['words'], hit['starts'], hit['ends']))
-    if cache_path:
+    if cache_path and aligned:
         save_alignments(cache_path, cached)
     return out
 

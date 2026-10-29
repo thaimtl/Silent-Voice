@@ -1,5 +1,6 @@
 """The face adapter: lipread/adapt.py's data handling, and LiveModel loading an adapter over the base weights."""
 import json
+import os
 
 import numpy as np
 import pytest
@@ -135,6 +136,17 @@ def test_word_ends_are_cached_and_a_hit_skips_the_encoder(tmp_path):
     word_ends(reader, rois, [1, 2, 3], 'clip_2', cache)
     assert reader.encoded == 2
     assert load_alignments(str(tmp_path / 'none.json')) == {}
+
+
+def test_concurrent_saves_of_one_alignment_cache_all_succeed(tmp_path):
+    from concurrent.futures import ThreadPoolExecutor
+    from lipread.adapt import load_alignments, save_alignments
+    path = str(tmp_path / 'align.json')
+    caches = [{f'clip_{i}': dict(words=['A'], starts=[0], ends=[1])} for i in range(8)]
+    with ThreadPoolExecutor(8) as pool:
+        list(pool.map(lambda c: [save_alignments(path, c) for _ in range(50)], caches))
+    assert load_alignments(path) in caches
+    assert sorted(os.listdir(tmp_path)) == ['align.json']
 
 
 def test_recipe_c_is_the_default_and_flags_override_it():

@@ -26,6 +26,7 @@ import json
 import os
 import re
 import sys
+import tempfile
 import time
 
 import jiwer
@@ -88,8 +89,9 @@ def crops(row, face_model, process_size=(1280, 720), root=RECORDINGS, cache=CROP
     out = np.stack(out)
     if path:
         os.makedirs(cache, exist_ok=True)
-        np.save(path + '.tmp.npy', out)
-        os.replace(path + '.tmp.npy', path)
+        tmp = f'{path}.{os.getpid()}.tmp.npy'
+        np.save(tmp, out)
+        os.replace(tmp, path)
     return out
 
 
@@ -159,10 +161,13 @@ def load_alignments(path):
 
 
 def save_alignments(path, cache):
-    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
-    with open(path + '.tmp', 'w') as f:
+    """Atomic write; a unique temp name, so evals saving the same cache at once don't race."""
+    folder = os.path.dirname(os.path.abspath(path))
+    os.makedirs(folder, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=folder, prefix=os.path.basename(path) + '.', suffix='.tmp')
+    with os.fdopen(fd, 'w') as f:
         json.dump(cache, f)
-    os.replace(path + '.tmp', path)
+    os.replace(tmp, path)
 
 
 def word_ends(reader, rois, ids, clip_id=None, cache=None):
