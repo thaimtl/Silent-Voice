@@ -382,7 +382,8 @@ def main(argv=None):
     rows = sentence_clips(args.sessions)[:args.clips]
     clips = [dict(rois=crops(r, face), text=r['prompt'], id=r['id']) for r in rows]
     aligner = LiveModel(warmup=(), face_adapter=args.aligner)
-    model = LiveModel(half=not args.fp32, face_adapter=args.adapter)
+    # the batched path never times single reads, so the 200-length warm-up (cuDNN / kernel first-call cost only) is waste
+    model = LiveModel(half=not args.fp32, face_adapter=args.adapter, warmup=() if not args.per_tick else range(1, 201))
     t0 = time.time()
     stem = os.path.splitext(os.path.basename(args.aligner))[0]
     cache = os.path.join(lipread.WORK, 'data', 'streaming_eval', f'align_{stem}.json')
