@@ -258,6 +258,24 @@ def test_plan_follows_the_flags(tmp_path):
     assert names(rehearse) == ['Logger', 'Decoder'] and {'--no-emg', '--no-claude'} <= set(rehearse.plan()[-1].cmd)
 
 
+def test_the_camera_loads_the_face_adapter_and_preflight_needs_it(tmp_path, monkeypatch):
+    lc = launcher(tmp_path)
+    cam = next(p for p in lc.plan() if p.name == 'Camera').cmd
+    assert cam[cam.index('--face-adapter') + 1] == str(tmp_path / 'data' / 'face_adapter' / 'austin.pth')
+    monkeypatch.setattr(launch, 'gpu_ok', lambda: True)
+    monkeypatch.setattr(Launcher, 'camera_opens', lambda self: True)
+    out = io.StringIO()
+    with redirect_stdout(out):
+        lc.preflight()
+    assert 'face adapter data/face_adapter/austin.pth: copy austin.pth' in out.getvalue()
+    (tmp_path / 'data' / 'face_adapter').mkdir(parents=True)
+    (tmp_path / 'data' / 'face_adapter' / 'austin.pth').write_bytes(b'')
+    out = io.StringIO()
+    with redirect_stdout(out):
+        lc.preflight()
+    assert 'face adapter data/face_adapter/austin.pth' in out.getvalue() and 'copy austin.pth' not in out.getvalue()
+
+
 def test_record_inbound_is_always_off(tmp_path, monkeypatch):
     monkeypatch.setenv('RECORD_INBOUND', 'inbound.ulaw')
     assert launcher(tmp_path).env['RECORD_INBOUND'] == ''
