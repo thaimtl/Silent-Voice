@@ -39,6 +39,7 @@ speech the muscles detect while the camera has no face ends in "Please repeat" (
 import sys
 import time
 from collections import deque
+from concurrent.futures import Future, ThreadPoolExecutor
 
 import numpy as np
 
@@ -82,6 +83,7 @@ class Utterance:
         self.repeat_sent = False
         self.carried_from = None       # the utterance whose segment the camera capped (8 s) to open this one
         self.sent = None               # its Sentence
+        self.emg_job = None            # (start, Future) of the SVR-1 read its next pass uses (Fusion emg_async)
 
 
 class Sentence:
@@ -116,18 +118,21 @@ class Sentence:
 class Fusion:
     def __init__(self, search, gate, lock, svr=None, repair_s=0.3, end_wait_s=0.3, final_wait_s=2.5,
                  use_emg=True, use_lm=True, use_hints=True, idle_emg=True, record=False, oracle=None, sentences=True,
-                 claude_end=None):
+                 claude_end=None, emg_async=True):
         """idle_emg: between camera segments, keep reading SVR-1 to catch speech without a face (live only);
         record: keep every pass's judge scores and lock features in self.records (fitting, evaluation);
         oracle(utterance) -> true sentence or None, scored on the final pass when recording (gate fitting);
         sentences: a sentence goes on across pauses (module docstring), else one per segment (offline fitting);
-        claude_end: ask Claude whether Austin has finished (default: use_hints)."""
+        claude_end: ask Claude whether Austin has finished (default: use_hints);
+        emg_async: a pass uses the SVR-1 read its segment's previous pass started, so it never waits for SVR-1 unless
+        SVR-1 is slower than a tick (False: each pass waits for a read of its own, as before; _emg_job)."""
         self.search, self.gate, self.lock, self.svr = search, gate, lock, svr
         self.repair_s, self.end_wait_s, self.final_wait_s = repair_s, end_wait_s, final_wait_s
         self.use_emg, self.use_lm, self.use_hints = use_emg and svr is not None, use_lm, use_hints
         self.records = [] if record else None
         self.oracle = oracle
         self.idle_emg = idle_emg
+        self.emg_async = emg_async
         self.hold = sentences
         self.claude_end = use_hints if claude_end is None else claude_end
         self.utt = None                # the open utterance
@@ -144,7 +149,6 @@ class Fusion:
         self.last_emg_read = None
         self.idle_read_t = -1e18
         self.emg_only = None           # time an EMG-detected segment started with no camera segment
-        from concurrent.futures import ThreadPoolExecutor
         self._pool = ThreadPoolExecutor(1, thread_name_prefix='svr')
 
     # ------------------------------------------------------------------ input
@@ -403,6 +407,7 @@ class Fusion:
         out = self._guard('final pass', lambda: self._pass(u, now, final=True, nbest=u.nbest or (), settle=True)) \
             if u.cam is not None else []
         u.state = 'done'                    # even after a failed pass: its locked words are said, the rest repeated
+        u.emg_job = None
         rest = list(range(len(u.locked), len(u.locked) + len(u.unlocked)))
         if rest and not u.repeat_sent:
             out.append(('dec.repeat', self._repeat_msg(u, rest)))
@@ -421,14 +426,36 @@ class Fusion:
                    'beta': self.gate.beta if self.use_hints else 0.0, 'gamma': self.gate.gamma,
                    'final': self.gate.final, 'unseen': self.gate.unseen}
 
+    def _emg_job(self, u, final):
+        """The SVR-1 read this pass uses, as a Future; it re-reads u's segment on the GPU while the camera beam runs
+        here. Every read takes its signal now (LiveSVR1.window), so its result never depends on when it runs.
+        Sync: the read started now. Async: the read u's previous pass started (done ~100 ms ago live) and a new one
+        for the next pass; a segment's first pass, and its end and final passes (off the tick path, and the last
+        100 ms of speech decide its last words and "Please repeat"), wait for the read started now."""
+        start = float(u.cam.frame_t[0]) if u.carried_from is not None else u.seg_start   # carried EMG: read already
+        window = self.svr.window(start)
+        if window is not None:
+            job = self._pool.submit(self.svr.read, True, start, window)
+        else:                               # no EMG yet: nothing to read
+            job = Future()
+            job.set_result(None)
+        if not self.emg_async:
+            return job
+        prev, u.emg_job = u.emg_job, (start, job)
+        if prev is not None and prev[0] == start and not final:
+            return prev[1]
+        if prev is not None:
+            prev[1].cancel()                # unused: drop it unless it already runs
+        return job
+
     def _pass(self, u, now, final, nbest=(), settle=False):
         t_start = time.perf_counter()
         self._quality()
-        # SVR-1 re-reads the segment on the GPU while the camera beam runs here; the gate uses the newest EMG read
-        # it has (the previous pass's, 100 ms old)
-        start = float(u.cam.frame_t[0]) if u.carried_from is not None else u.seg_start   # carried EMG: read already
-        job = self._pool.submit(self.svr.read, True, start) if self.use_emg else None
-        gf, w = self._weights(u.cam, self.last_emg_read if self.use_emg else None)
+        job = self._emg_job(u, final) if self.use_emg else None
+        if job is not None and self.emg_async:      # the read is done (live) or deterministic (offline): gate on it
+            gf, w = self._weights(u.cam, job.result())
+        else:   # sync: the gate uses the newest EMG read it has (the previous pass's, 100 ms old)
+            gf, w = self._weights(u.cam, self.last_emg_read if self.use_emg else None)
         hints = self.hints if (self.use_hints and now < self.hints_until) else {}
         locked = [x['w'] for x in u.locked]
         cands = self.search.candidates(u.cam, w, hints, locked, [h['text'] for h in nbest], final,
@@ -446,7 +473,7 @@ class Fusion:
             self.search.extend(cands, [greedy_decode(emg_read['letter_logp'])], locked)
         elif self.use_emg:
             w['emg'] = 0.0
-        emg_fn = self.svr.verify if emg_read is not None else None
+        emg_fn = (lambda texts: self.svr.verify(texts, emg_read['out'])) if emg_read is not None else None
         scores = self.search.judge_scores(cands, u.cam, emg_fn, hints, final, nbest)
         P = softmax(self.search.combine(scores, w))
         Pc = softmax(self.gate.t_cam * scores[:, 0])
@@ -636,7 +663,7 @@ class Fusion:
     def _idle_emg(self, now):
         """No camera segment: keep SVR-1's own segmentation going; speech it hears without a face -> Please repeat."""
         self.idle_read_t = now
-        r = self.svr.read(camera_active=False)
+        r = self._pool.submit(self.svr.read, False).result()  # after any camera read still running: one at a time
         if r is None:
             return []
         if r['segment_started']:

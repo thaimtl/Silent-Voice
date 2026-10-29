@@ -14,6 +14,7 @@ from fusion.lm import ConversationLM
 from fusion.lock import FEATURES, LockModel
 from fusion.offline import align
 from fusion.search import BLANK, CamReading, Gate, JointSearch, Pieces, ctc_loglik, viterbi_word_ends
+from svr.text import BLANK as BLANK_LETTER
 
 ARPA = r"""
 \data\
@@ -113,6 +114,112 @@ def brute_ctc(cam, seq):
             b[s] = np.logaddexp.reduce(terms) + e(t, s)
         a = b
     return np.logaddexp(a[-1], a[-2])
+
+
+class FakeSVR:
+    """SVR-1 stand-in for fusion's EMG scheduling: read i (numbered as window() takes its signal) reports pace i and
+    the samples it saw; hold() makes the next read wait for release(i), as a slow GPU would."""
+
+    def __init__(self):
+        import threading
+        self.threading = threading
+        self.n, self.next = 0, 0
+        self.gates, self.done, self.timed_out, self.verified = {}, [], [], []
+
+    def feed(self, x, t0=None):
+        self.n += len(x)
+
+    def window(self, start_t):
+        self.next += 1
+        return {'i': self.next - 1, 'n': self.n, 'start': start_t}
+
+    def hold(self):
+        self.gates[self.next] = self.threading.Event()
+        return self.next
+
+    def release(self, i):
+        self.gates[i].set()
+
+    def read(self, camera_active=False, start_t=None, window=None):
+        if window is None:
+            return None
+        i = window['i']
+        if i in self.gates and not self.gates[i].wait(2.0):
+            self.timed_out.append(i)
+        self.done.append(i)
+        logp = np.full((30, BLANK_LETTER + 1), -10.0, np.float32)
+        logp[:, BLANK_LETTER] = 0.0                 # SVR-1 reads nothing: no EMG candidates
+        return {'pace': float(i), 'effort': 1.0, 'rate_z': 0.0, 'speak_prob': np.full(30, 0.9, np.float32),
+                'letter_logp': logp, 'out': dict(window)}
+
+    def verify(self, texts, out=None):
+        self.verified.append(out)
+        return np.zeros(len(texts))
+
+
+def emg_schedule(arpa, pieces, emg_async, late_release):
+    """One run: two segments, emg.raw between ticks. late_release: a held read finishes 50 ms later, after the next
+    emg.raw (the GPU behind), else at once. Returns (published messages, records, FakeSVR, per-pass checks)."""
+    lock = LockModel(tau0=0.5, tau_min=0.5, tau_max=0.5, agree_floor=0.0)
+    search = JointSearch(ConversationLM(arpa), pieces, StubLexicon({'water': ['waiter'], 'waiter': ['water']}))
+    svr = FakeSVR()
+    core = Fusion(search, Gate(), lock, svr=svr, use_hints=False, repair_s=0.3, sentences=False, idle_emg=False,
+                  record=True, emg_async=emg_async)
+    out, passes = [], []
+    t = 100.0
+    for seg, words, t0 in ((1, ['i', 'want', 'water'], 100.0), (2, ['i', 'want'], 102.0)):
+        full = reading(pieces, words, seg_id=seg, t0=t0)
+        for n in range(8, len(full['frame_t']) + 1, 3):
+            msg = {k: (v[:n] if isinstance(v, np.ndarray) else v) for k, v in full.items()}
+            t = float(msg['frame_t'][-1]) + 0.05
+            out += core.feed('emg.raw', {'samples': np.zeros((40, 4)), 't0': t - 0.04}, t)
+            held = svr.hold() if emg_async and n > 8 else None   # a segment's first pass must wait: not held
+            n_reads = svr.next
+            out += core.feed('cam.tick', msg, t)
+            used = svr.verified[-1]
+            passes.append(dict(seg_start=full['seg_start'], used=used, first_new=n_reads, reads=svr.next,
+                               held=held, held_done=held in svr.done, pace=core.pace))
+            if held is not None and late_release:     # finishes after the next emg.raw is fed
+                svr.threading.Timer(0.05, svr.release, [held]).start()
+            elif held is not None:
+                svr.release(held)
+            out += core.step(t)
+    for k in range(1, 80):
+        out += core.step(t + 0.05 * k)
+        if k == 10:
+            out += core.feed('cam.final', {'seg_id': 2, 'nbest': [{'text': 'I WANT', 'score': 0.0}]}, t + 0.05 * k)
+    return out, core.records, svr, passes
+
+
+def emg_schedule_checks(arpa, pieces):
+    out, recs, svr, passes = emg_schedule(arpa, pieces, True, False)
+    check('async EMG: no read was ever waited on past its release', not svr.timed_out, str(svr.timed_out))
+    check('async EMG: a tick pass never waits for the read it starts',
+          all(p['held'] is None or not p['held_done'] for p in passes) and
+          sum(p['held'] is not None for p in passes) >= 4)
+    firsts = [k for k, p in enumerate(passes) if k == 0 or p['seg_start'] != passes[k - 1]['seg_start']]
+    check('async EMG: a segment\'s first pass reads it afresh (one read started in that pass)',
+          all(passes[k]['used']['i'] >= passes[k]['first_new'] for k in firsts), str([passes[k] for k in firsts]))
+    later = [p for k, p in enumerate(passes) if k not in firsts]
+    check('async EMG: every other tick pass uses the read the previous pass started, for scores, pace and gate',
+          all(p['used']['i'] == passes[k - 1]['reads'] - 1 and p['pace'] == p['used']['i']
+              for k, p in enumerate(passes) if k not in firsts) and len(later) >= 4,
+          str([(p['used']['i'], p['pace']) for p in passes]))
+    check('async EMG: a read for one segment never feeds another',
+          all(p['used']['start'] == p['seg_start'] for p in passes) and
+          all(v['start'] == r['seg_start'] for v, r in zip(svr.verified, recs) if 'seg_start' in r))
+    end_reads = svr.verified[len(passes):]
+    check('async EMG: the end and final passes read every sample fed so far',
+          len(end_reads) >= 2 and all(v['n'] == svr.n for v in end_reads[-2:]), str(end_reads))
+    out2, recs2, _, _ = emg_schedule(arpa, pieces, True, True)
+    # wall-clock times differ: pass timings, and the end pass's time (end_wait_s counts from the end of a pass)
+    timeless = lambda o, r: repr(([m for m in o if m[0] != 'timing.dec'],  # noqa: E731
+                                  [{k: v for k, v in x.items() if k not in ('ms', 't')} for x in r]))
+    check('async EMG: two runs give the same output, however late SVR-1 finishes',
+          timeless(out, recs) == timeless(out2, recs2))
+    _, _, svr_s, passes_s = emg_schedule(arpa, pieces, False, False)
+    check('sync EMG (--emg-sync): each pass waits for the read it starts',
+          all(p['used']['i'] == p['reads'] - 1 for p in passes_s), str([p['used']['i'] for p in passes_s]))
 
 
 def main():
@@ -565,6 +672,8 @@ def main():
         check('offline (sentences off): one utt_id per segment, as before',
               {m['utt_id'] for tp, m in out if tp == 'dec.hyp'} == {1, 2} and
               len([m for tp, m in out if tp == 'voice.say' and m['final']]) == 2)
+
+        emg_schedule_checks(path, pieces)
     from fusion.run import drain
 
     class Q:
