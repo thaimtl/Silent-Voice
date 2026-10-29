@@ -573,6 +573,13 @@ def cmd_test(a):
                              delay_median_s=float(np.median(delays)) if delays else None,
                              delay_p90_s=float(np.percentile(delays, 90)) if delays else None,
                              pass_ms_median=float(np.median(ms)), pass_ms_p95=float(np.percentile(ms, 95)))
+        tick = [r for r in recs if not r['final']]
+        if tick:    # tick passes, and the same without waiting for SVR-1 (live, an async read ends between ticks)
+            tm = [r['ms'] for r in tick]
+            tw = [r['ms'] - r.get('emg_wait_ms', 0.0) for r in tick]
+            results[name].update(tick_ms_median=float(np.median(tm)), tick_ms_p95=float(np.percentile(tm, 95)),
+                                 tick_nowait_ms_median=float(np.median(tw)),
+                                 tick_nowait_ms_p95=float(np.percentile(tw, 95)))
         print(name, json.dumps(results[name]), flush=True)
     # reference: the camera's own final pass (cam.final's best) on the same sentences
     import buslog

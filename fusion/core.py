@@ -426,34 +426,43 @@ class Fusion:
                    'beta': self.gate.beta if self.use_hints else 0.0, 'gamma': self.gate.gamma,
                    'final': self.gate.final, 'unseen': self.gate.unseen}
 
-    def _emg_job(self, u, final):
-        """The SVR-1 read this pass uses, as a Future; it re-reads u's segment on the GPU while the camera beam runs
-        here. Every read takes its signal now (LiveSVR1.window), so its result never depends on when it runs.
-        Sync: the read started now. Async: the read u's previous pass started (done ~100 ms ago live) and a new one
-        for the next pass; a segment's first pass, and its end and final passes (off the tick path, and the last
-        100 ms of speech decide its last words and "Please repeat"), wait for the read started now."""
-        start = float(u.cam.frame_t[0]) if u.carried_from is not None else u.seg_start   # carried EMG: read already
+    def _emg_read(self, u):
+        """(start, Future) of an SVR-1 read of u's segment started now. It takes its signal now
+        (LiveSVR1.window), so its result never depends on when it runs."""
+        start = self._emg_read_start(u)
         window = self.svr.window(start)
         if window is not None:
-            job = self._pool.submit(self.svr.read, True, start, window)
-        else:                               # no EMG yet: nothing to read
-            job = Future()
-            job.set_result(None)
-        if not self.emg_async:
-            return job
-        prev, u.emg_job = u.emg_job, (start, job)
-        if prev is not None and prev[0] == start and not final:
+            return start, self._pool.submit(self.svr.read, True, start, window)
+        job = Future()                      # no EMG yet: nothing to read
+        job.set_result(None)
+        return start, job
+
+    def _emg_job(self, u, final):
+        """The SVR-1 read this pass uses, as a Future. Sync: a read started now, which re-reads u's segment on the GPU
+        while the camera beam runs here. Async: the read u's previous pass started at its end (it ran in the gap
+        between ticks, done live); a segment's first pass, and its end and final passes (off the tick path, and the
+        last 100 ms of speech decide its last words and "Please repeat"), wait for a read started now."""
+        prev, u.emg_job = u.emg_job, None
+        if self.emg_async and not final and prev is not None and prev[0] == self._emg_read_start(u):
             return prev[1]
         if prev is not None:
             prev[1].cancel()                # unused: drop it unless it already runs
-        return job
+        return self._emg_read(u)[1]
+
+    @staticmethod
+    def _emg_read_start(u):
+        return float(u.cam.frame_t[0]) if u.carried_from is not None else u.seg_start   # carried EMG: read already
 
     def _pass(self, u, now, final, nbest=(), settle=False):
         t_start = time.perf_counter()
         self._quality()
         job = self._emg_job(u, final) if self.use_emg else None
+        wait_ms = 0.0                       # spent waiting for SVR-1 (offline, back to back, a read live finishes between ticks)
         if job is not None and self.emg_async:      # the read is done (live) or deterministic (offline): gate on it
-            gf, w = self._weights(u.cam, job.result())
+            t_wait = time.perf_counter()
+            first = job.result()
+            wait_ms = (time.perf_counter() - t_wait) * 1000
+            gf, w = self._weights(u.cam, first)
         else:   # sync: the gate uses the newest EMG read it has (the previous pass's, 100 ms old)
             gf, w = self._weights(u.cam, self.last_emg_read if self.use_emg else None)
         hints = self.hints if (self.use_hints and now < self.hints_until) else {}
@@ -461,7 +470,9 @@ class Fusion:
         cands = self.search.candidates(u.cam, w, hints, locked, [h['text'] for h in nbest], final,
                                        phrases=self.phrases if hints else (),
                                        locked_tokens=[x['tokens'] for x in u.locked])
+        t_wait = time.perf_counter()
         emg_read = job.result() if job is not None else None
+        wait_ms += (time.perf_counter() - t_wait) * 1000
         if emg_read is not None:
             self.last_emg_read = emg_read
             self.pace = emg_read['pace'] if np.isfinite(emg_read['pace']) else 1.0
@@ -527,6 +538,8 @@ class Fusion:
         u.unlocked_conf = [x['p'] for x in rest]
         u.unlocked_src = [self._source(x) for x in rest]
         u.last_words = rest
+        if job is not None and self.emg_async and not final:
+            u.emg_job = self._emg_read(u)   # the next pass's read: runs in the gap before the next tick, not beside this pass
         ms = (time.perf_counter() - t_start) * 1000
         if self.records is not None:
             rec = dict(utt_id=u.utt_id, sentence=sid, seg_id=u.seg_id, seg_start=u.seg_start, t=now, final=final,
@@ -534,7 +547,7 @@ class Fusion:
                        cands=[c.words for c in cands], sources=[c.source for c in cands], best=best.words,
                        n_locked_before=len(locked), locked_now=[x['w'] for x in new],
                        words=[dict(i=x['i'], w=x['w'], p=x['p'], f=x['f'], cam_top=x['cam_top'],
-                                   emg_top=x['emg_top']) for x in words], tau=tau, ms=ms,
+                                   emg_top=x['emg_top']) for x in words], tau=tau, ms=ms, emg_wait_ms=wait_ms,
                        cam_frame_t=float(u.cam.frame_t[-1]) if u.cam is not None else None)
             if final and self.oracle is not None:
                 truth = self.oracle(u)
