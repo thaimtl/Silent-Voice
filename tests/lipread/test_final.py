@@ -207,3 +207,27 @@ def test_real_beam_on_the_sample(sample_video, face_model):
     check_sample_nbest(gpu)
     assert gpu[0][0] == sent[0].nbest[0][0]
     print(f'\nbeam {fp.stats[0]["beam_ms"]:.0f} ms (process, CPU), best: {sent[0].nbest[0]}')
+
+
+def test_load_ctc_head_takes_only_the_ctc_tensors(tmp_path):
+    import torch
+    from lipread.final import load_ctc_head
+
+    class Net(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.ctc = torch.nn.Module()
+            self.ctc.ctc_lo = torch.nn.Linear(3, 2)
+            self.decoder = torch.nn.Linear(3, 2)
+
+    adapter, base = Net(), Net()
+    with torch.no_grad():
+        for p in adapter.parameters():
+            p.add_(1.0)
+    torch.save(adapter.state_dict(), tmp_path / 'a.pth')
+    decoder_before = base.decoder.weight.clone()
+    assert load_ctc_head(base, str(tmp_path / 'a.pth')) == 2
+    assert torch.equal(base.ctc.ctc_lo.weight, adapter.ctc.ctc_lo.weight)
+    assert torch.equal(base.decoder.weight, decoder_before)
+    torch.save({'encoder.embed.weight': torch.zeros(1)}, tmp_path / 'b.pth')
+    assert load_ctc_head(base, str(tmp_path / 'b.pth')) == 0

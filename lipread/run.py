@@ -450,7 +450,7 @@ def main(argv=None):
         box = {}
         if not args.no_final:
             from lipread.final import FinalPass
-            starter = threading.Thread(target=lambda: box.update(final=FinalPass(None, pub.send)), name='final-start',
+            starter = threading.Thread(target=lambda: box.update(final=FinalPass(None, pub.send, face_adapter=args.face_adapter)), name='final-start',
                                        daemon=True)
             starter.start()
         model = LiveModel(half=not args.fp32, face_adapter=args.face_adapter)

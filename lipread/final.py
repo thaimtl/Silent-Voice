@@ -120,15 +120,30 @@ def lower_priority(nice):
         kernel32.SetPriorityClass(kernel32.GetCurrentProcess(), 0x4000)
 
 
+def load_ctc_head(model, path):
+    """The CTC head's tensors (ctc.*) of a face adapter trained with --train-ctc, over model's; any other tensor in
+    the file is ignored (the encoder is not in this process). Returns the tensor count."""
+    state = torch.load(path, map_location='cpu', weights_only=True)
+    ctc = {k: v for k, v in state.items() if k.startswith('ctc.')}
+    if ctc:
+        model.load_state_dict(ctc, strict=False)
+    return len(ctc)
+
+
 def _child(jobs, results, kw, device, threads, nice):
     """RemoteBeam's process: a LipReader without its encoder (decoder + CTC head + LM, on device) beams the encoder
-    outputs it is sent. jobs: enc (T, D) float32, None stops -> results (nbest or error text, beam_ms)."""
+    outputs it is sent. jobs: enc (T, D) float32, None stops -> results (nbest or error text, beam_ms).
+    kw['face_adapter']: the adapter the encoder runs, whose CTC head (if trained) the beam must use."""
+    kw = dict(kw)
+    adapter = kw.pop('face_adapter', None)
     signal.signal(signal.SIGINT, signal.SIG_IGN)
     torch.set_num_threads(threads)
     lower_priority(nice)
     from lipflow.vsr import LipReader
     reader = LipReader(device=device, use_lm=kw['lm_weight'] > 0, lm_weight=kw['lm_weight'],
                        ctc_weight=kw['ctc_weight'], personal=False)
+    if adapter:
+        load_ctc_head(reader.model, adapter)
     del reader.model.encoder
     if reader.device.type == 'cuda':
         torch.cuda.empty_cache()
@@ -153,10 +168,11 @@ class RemoteBeam:
     target: the child's function (tests swap in a fake one)."""
 
     def __init__(self, model=None, beam_size=BEAM, nbest=NBEST, lm_weight=LM_WEIGHT, ctc_weight=CTC_WEIGHT,
-                 device='cpu', threads=4, nice=10, start_timeout=120, target=_child):
+                 device='cpu', threads=4, nice=10, start_timeout=120, target=_child, face_adapter=None):
         self.model = model
         self.ctx = mp.get_context('spawn')
-        kw = dict(beam_size=beam_size, nbest=nbest, lm_weight=lm_weight, ctc_weight=ctc_weight)
+        kw = dict(beam_size=beam_size, nbest=nbest, lm_weight=lm_weight, ctc_weight=ctc_weight,
+                  face_adapter=face_adapter)
         self.args = (kw, device, threads, nice)
         self.device, self.threads, self.start_timeout, self.target = device, threads, start_timeout, target
         self.proc = None
@@ -238,10 +254,10 @@ class FinalPass:
     .errors: seg_ids whose beam raised (logged, nothing sent)."""
 
     def __init__(self, model, publish, beam_size=BEAM, nbest=NBEST, lm_weight=LM_WEIGHT, ctc_weight=CTC_WEIGHT,
-                 max_pending=MAX_PENDING, device='cpu', threads=4, beam=None):
+                 max_pending=MAX_PENDING, device='cpu', threads=4, beam=None, face_adapter=None):
         if beam is None:
             beam = RemoteBeam(model, beam_size=beam_size, nbest=nbest, lm_weight=lm_weight, ctc_weight=ctc_weight,
-                              device=device, threads=threads)
+                              device=device, threads=threads, face_adapter=face_adapter)
         self.beam, self.publish, self.max_pending = beam, publish, max_pending
         self.pending = collections.deque()
         self.cond = threading.Condition()
