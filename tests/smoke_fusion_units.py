@@ -214,7 +214,7 @@ def emg_schedule_checks(arpa, pieces):
     out2, recs2, _, _ = emg_schedule(arpa, pieces, True, True)
     # wall-clock times differ: pass timings, and the end pass's time (end_wait_s counts from the end of a pass)
     timeless = lambda o, r: repr(([m for m in o if m[0] != 'timing.dec'],  # noqa: E731
-                                  [{k: v for k, v in x.items() if k not in ('ms', 't')} for x in r]))
+                                  [{k: v for k, v in x.items() if k not in ('ms', 'emg_wait_ms', 't')} for x in r]))
     check('async EMG: two runs give the same output, however late SVR-1 finishes',
           timeless(out, recs) == timeless(out2, recs2))
     _, _, svr_s, passes_s = emg_schedule(arpa, pieces, False, False)
