@@ -524,6 +524,8 @@ def main(argv=None):
         if logf:
             logf.close()
     print(summary(runner.stats))
+    if getattr(source, 'fps_now', None) is not None:
+        print(f'camera delivered {source.fps_now:.1f} fps (rolling 5 s window at the end)')
     if torch.cuda.is_available():
         print(f'peak GPU memory {torch.cuda.max_memory_allocated() / 2 ** 20:.0f} MiB')
     return code

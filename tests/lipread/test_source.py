@@ -311,3 +311,48 @@ def test_load_ts_csv(tmp_path):
     np.testing.assert_allclose(load_ts(str(p)), [1.5, 1.53, 1.6])
     (tmp_path / 'u.mp4').write_bytes(b'')
     assert find_ts(str(tmp_path / 'u.mp4')) == str(p)
+
+
+def feed(mon, rate, seconds, t0=0.0):
+    """Push grabs at `rate` fps for `seconds` into an FpsMonitor; returns (messages, end time)."""
+    n, msgs = int(rate * seconds), []
+    for i in range(1, n + 1):
+        m = mon.push(t0 + i / rate)
+        if m:
+            msgs.append(m)
+    return msgs, t0 + n / rate
+
+
+def test_fps_monitor_is_silent_at_full_rate():
+    mon = source.FpsMonitor()
+    msgs, _ = feed(mon, 30, 12)
+    assert not msgs and mon.fps == pytest.approx(30, abs=0.5)
+
+
+def test_fps_monitor_warns_once_per_interval_when_slow():
+    mon = source.FpsMonitor()
+    assert mon.fps is None
+    msgs, _ = feed(mon, 16, 25)
+    assert mon.fps == pytest.approx(16, abs=0.5)
+    # window fills at 5 s; warnings at about 5, 15, 25 s, not on every frame (400 grabs)
+    assert 2 <= len(msgs) <= 3 and '16.' in msgs[0]
+
+
+def test_fps_monitor_recovers_and_warns_again_after_a_new_drop():
+    mon = source.FpsMonitor()
+    m1, t = feed(mon, 15, 8)
+    m2, t = feed(mon, 30, 8, t)
+    assert len(m1) == 1 and not m2 and mon.fps == pytest.approx(30, abs=0.5)
+    m3, _ = feed(mon, 10, 8, t)
+    assert len(m3) >= 1
+
+
+def test_camera_source_exposes_fps_now(stall_cam, monkeypatch, caplog):
+    real = source.FpsMonitor
+    monkeypatch.setattr(source, 'FpsMonitor', lambda: real(window_s=0.3, low=60, warn_every_s=100))
+    src = stall_cam([30])       # 20 ms per grab = 50 fps, under the 60 fps threshold set above
+    assert src.fps_now is None
+    drain(src)
+    src.close()
+    assert src.fps_now == pytest.approx(50, abs=10)
+    assert 'fps over the last' in caplog.text and caplog.text.count('fps over the last') == 1

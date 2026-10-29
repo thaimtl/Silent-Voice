@@ -44,6 +44,9 @@ GRID = 1.0 / FPS
 MAX_REPEAT = 3
 MEASURE_GRABS = 31
 SLOW_FPS = 28
+LOW_FPS = 20            # delivered rate (rolling FPS_WINDOW_S) under which the live monitor warns
+FPS_WINDOW_S = 5.0
+FPS_WARN_EVERY_S = 10.0
 # Windows DirectShow (OpenCV 5): grab() returns at once and retrieve() waits for the frame, so a grab-only loop spins
 # and stamps frames before they arrive. There every frame is read, and stamped once it is in.
 READ_EVERY_FRAME = sys.platform == 'win32'
@@ -71,6 +74,37 @@ class Resampler:
             self.next_t = t + GRID
             n = 1
         return n
+
+
+class FpsMonitor:
+    """Delivered grab rate over the last `window_s` seconds, fed one timestamp per good grab (no thread, O(1) per frame).
+
+    `fps` is None until a full window has been seen. `push(t)` returns a message the first time the rate is under `low`
+    and then at most once per `warn_every_s`, else None.
+    """
+
+    def __init__(self, window_s=FPS_WINDOW_S, low=LOW_FPS, warn_every_s=FPS_WARN_EVERY_S):
+        self.window_s, self.low, self.warn_every_s = window_s, low, warn_every_s
+        self.fps = None
+        self._ts = deque()
+        self._next_warn = None
+
+    def push(self, t):
+        ts = self._ts
+        ts.append(t)
+        while len(ts) > 1 and ts[1] <= t - self.window_s:   # keep one grab at or before the window start
+            ts.popleft()
+        span = t - ts[0]
+        if span < self.window_s * 0.9 or len(ts) < 2:
+            return None
+        self.fps = (len(ts) - 1) / span
+        if self.fps >= self.low:
+            self._next_warn = None
+            return None
+        if self._next_warn is not None and t < self._next_warn:
+            return None
+        self._next_warn = t + self.warn_every_s
+        return f'only {self.fps:.1f} fps over the last {span:.0f} s (want {self.low}+): the live reader is starved'
 
 
 TS_SUFFIXES = ('_video_ts', '.video_t', '_video_t', '.video_ts')
@@ -403,6 +437,8 @@ class CameraSource:
         self.cam_fps = self._pick_fps(fps)
         self.keep_every = keep_every(self.cam_fps)
         self.measured_fps = None
+        self.fps_monitor = FpsMonitor()
+        self.fps_now = None             # delivered fps over the last FPS_WINDOW_S, None until one window has passed
         self.fourcc = int(self.cap.get(cv2.CAP_PROP_FOURCC)).to_bytes(4, 'little').decode(errors='replace')
         self.size = (int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH)), int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT)))
         if self.size != (width, height) or self.fourcc != 'MJPG':
@@ -501,6 +537,10 @@ class CameraSource:
             t = now()
             if ok:
                 self.grab_ts.append(t)
+                warn = self.fps_monitor.push(t)
+                self.fps_now = self.fps_monitor.fps
+                if warn:
+                    log.warning('camera %s: %s', self.device, warn)
                 n += 1
                 if n == MEASURE_GRABS:
                     self._measure()
