@@ -263,7 +263,7 @@ def test_plan_follows_the_flags(tmp_path):
 def test_the_camera_loads_the_face_adapter_and_preflight_needs_it(tmp_path, monkeypatch):
     lc = launcher(tmp_path)
     cam = next(p for p in lc.plan() if p.name == 'Camera').cmd
-    assert cam[cam.index('--face-adapter') + 1] == str(tmp_path / 'data' / 'face_adapter' / 'austin.pth')
+    assert cam[cam.index('--face-adapter') + 1] == str(tmp_path / 'data' / 'face_adapter' / 'austin_C_s12_soup8.pth')
     keys = tmp_path / 'keys.env'
     keys.write_text('')
     lc.keys = {k: 'x' for k in launch.NEEDED_KEYS}
@@ -277,9 +277,9 @@ def test_the_camera_loads_the_face_adapter_and_preflight_needs_it(tmp_path, monk
     out = io.StringIO()
     with redirect_stdout(out):
         assert not lc.preflight()
-    assert 'face adapter data/face_adapter/austin.pth: copy austin.pth' in out.getvalue()
+    assert 'face adapter data/face_adapter/austin_C_s12_soup8.pth: copy austin_C_s12_soup8.pth' in out.getvalue()
     (tmp_path / 'data' / 'face_adapter').mkdir(parents=True)
-    (tmp_path / 'data' / 'face_adapter' / 'austin.pth').write_bytes(b'')
+    (tmp_path / 'data' / 'face_adapter' / 'austin_C_s12_soup8.pth').write_bytes(b'')
     with redirect_stdout(io.StringIO()):
         assert lc.preflight()
 

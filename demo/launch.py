@@ -47,7 +47,7 @@ BUS_PORTS = {'emg': 5555, 'cam': 5556, 'dec': 5557, 'claude': 5558, 'call': 5559
 CALL_PORT, DASH_PORT = 8787, 8790
 MAX_RESTARTS = 3
 REHEARSAL_LOG = 'cam_s3_test'
-FACE_ADAPTER = Path('data', 'face_adapter', 'austin.pth')
+FACE_ADAPTER = Path('data', 'face_adapter', 'austin_C_s12_soup8.pth')
 TUNNEL_URL = re.compile(r'https://(?!api\.)[a-z0-9-]+\.trycloudflare\.com')   # not cloudflared's own API
 
 
@@ -363,7 +363,7 @@ class Launcher:
         else:
             check(self.camera_opens(), f'webcam {a.cam}', 'plug in the C920, close other apps using it, or pass --cam 1')
             check((self.work / FACE_ADAPTER).exists(), f'face adapter {FACE_ADAPTER.as_posix()}',
-                  'copy austin.pth from Evan into data/face_adapter/')
+                  f'copy {FACE_ADAPTER.name} from Evan into data/face_adapter/')
         if not (a.no_emg or a.rehearse):
             self.uno = a.port or self.find_uno()
             check(bool(self.uno), f'Uno on {self.uno or "?"}', 'plug in its USB cable, pass --port COMx, or --no-emg')
