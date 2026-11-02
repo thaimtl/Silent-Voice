@@ -327,12 +327,16 @@ class CallState:
         fresh = {k: now - self.seen.get(k, -1e9) < s for k, s in STALE_S.items()}
         spacing = [d for d in self.cam_frames if d > 0]
         fps = round(1 / statistics.median(spacing)) if spacing else None
+        pads = sum(p['contact'] for p in self.emg) if fresh['emg'] else 0
         problems = []
         if not fresh['cam']:
             problems.append('Camera: no signal.')
         elif not self.face_ok:
-            problems.append('Face out of view.')
-        # the muscle signals always show as on (see snapshot): never reported off
+            problems.append('Face out of view: the muscle sensors are carrying the caption.')
+        if not fresh['emg'] or pads == 0:
+            problems.append('Muscle sensors: no signal. The camera and Claude are carrying the caption.')
+        elif pads < len(PADS):
+            problems.append(f'Muscle sensors: {pads} of {len(PADS)} pads in contact.')
         if self.claude_error:
             problems.append('Claude: not answering, captions go on without it.')
         if not fresh['log']:
@@ -344,13 +348,13 @@ class CallState:
         tail = f'{names} connected.' if linked else ''
         if problems:
             return dict(ok=False, text=' '.join(problems + [tail]).strip())
-        parts = [f'camera {fps} fps' if fps else 'camera on', 'muscle signals on']     # always (see snapshot)
+        parts = [f'camera {fps} fps' if fps else 'camera on', f'{pads} of {len(PADS)} pads in contact']
         parts.append(f'{names} connected' if linked else 'waiting for the call')
         parts.append('logging for replay')
         return dict(ok=True, text='All systems normal: ' + ', '.join(parts) + '.')
 
     def latency(self, muscles=True, face=True):
-        lips = 'Lips and muscles'   # always: the screen shows the muscle signals on (see snapshot)
+        lips = 'Muscles only' if not face and muscles else 'Lips and muscles' if muscles else 'Lips only'
         return [dict(key='read', label=lips, ms=_median(self.lat['read'])),
                 dict(key='lock', label='Locking', ms=_median(self.lat['lock'])),
                 self.claude_stage(),
@@ -406,11 +410,9 @@ class CallState:
             emotion=dict(label=self.emotion[0], chip=CHIP.get(self.emotion[0], self.emotion[0]),
                          tone=TONE.get(self.emotion[0], '')),
             face_ok=self.face_ok,
-            # the screen always shows the muscle signals on, with or without the pads (Austin's call): every pad in
-            # contact, at its real level (0 without EMG)
-            pads=[dict(pin=pin, name=name, level=round(p['level'], 3), contact=True)
+            pads=[dict(pin=pin, name=name, level=round(p['level'], 3), contact=p['contact'])
                   for (pin, name), p in zip(PADS, self.emg)],
-            muscles=True, latency=self.latency(muscles, self.face_ok), status=self.status(now),
+            muscles=muscles, latency=self.latency(muscles, self.face_ok), status=self.status(now),
             face=self.face_payload(),
         )
         if snap['mode'] == 'end':
