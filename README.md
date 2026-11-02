@@ -3,7 +3,8 @@
 Silent Voice gives a voice back to people who lost their voice box.
 You mouth the words without a sound, and Silent Voice speaks them in your own voice while you're still mouthing, even on a phone call.
 
-We built it at Cal Hacks 13.0.
+We built it at Cal Hacks 13.0, where it placed 2nd overall and won Cartesia's voice AI challenge.
+The story of the weekend is in [Thai's writeup](https://thaimtl.github.io/cal-hacks-13/).
 
 ## Who it's for
 
