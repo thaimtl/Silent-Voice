@@ -111,3 +111,8 @@ Data folders are in `.gitignore`.
 ## Team
 
 Thai (EMG hardware and the Claude service), Austin (EMG model and fusion, and the speaker in the demo), Frank (Cartesia voice, the Twilio call, and the captions dashboard), and Evan (real-time lip reading and facial emotion).
+
+## License
+
+Silent Voice is open source under the [MIT license](LICENSE).
+Bundled third-party files keep their own licenses, which are Mermaid (MIT, `docs/vendor/mermaid.LICENSE`), the Liberation Sans and Atkinson Hyperlegible Next fonts (SIL Open Font License 1.1), and MediaPipe's face mesh data (Apache-2.0).
