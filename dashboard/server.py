@@ -30,7 +30,7 @@ from dashboard.state import CallState
 log = logging.getLogger('dashboard')
 HERE = os.path.dirname(os.path.abspath(__file__))
 STATIC = os.path.join(HERE, 'static')
-TOPICS = ('call.state', 'partner.text', 'dec.', 'claude.repair', 'voice.say', 'cam.tick', 'cam.face',
+TOPICS = ('call.state', 'partner.text', 'dec.', 'claude.repair', 'claude.caption', 'voice.say', 'cam.tick', 'cam.face',
           'cam.preview', 'emg.raw', 'timing.')
 SNAPSHOT_HZ = 15
 FRAME_MAGIC = b'RCF1'   # binary frame: magic, 4-byte big-endian header length, JSON header, JPEG

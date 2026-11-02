@@ -201,10 +201,10 @@ class CallState:
         u['caption'] = words
         for line in reversed(self.transcript):
             if line.get('who') == 'austin' and line.get('utt_id') == u['utt_id']:
+                self.captions_fixed += not line.get('caption_fixed')     # a retried pass counts once
                 line.setdefault('original', line['text'])
                 line['text'] = pretty(words)
                 line['caption_fixed'] = True
-                self.captions_fixed += 1
                 break
 
     def _say(self, topic, msg, now):
