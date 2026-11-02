@@ -189,6 +189,8 @@ def test_resampler_matches_lipreader():
 class FakeCap:
     """cv2.VideoCapture stand-in: grabs at the rate set with CAP_PROP_FPS (no webcam on the dev box)."""
 
+    offered = ()
+
     def __init__(self, *a):
         self.props = {cv2.CAP_PROP_FPS: 30.0, cv2.CAP_PROP_FRAME_WIDTH: 640, cv2.CAP_PROP_FRAME_HEIGHT: 480,
                       cv2.CAP_PROP_FOURCC: float(cv2.VideoWriter_fourcc(*'MJPG'))}
@@ -225,7 +227,7 @@ class FakeCap:
 @pytest.mark.parametrize('offered,cam_fps,keep', [((30, 60), 60, 1), ((30, 50, 60), 50, 2), ((30,), 30, 1)])
 def test_camera_source_rates(monkeypatch, offered, cam_fps, keep):
     import lipread.source as source
-    monkeypatch.setattr(FakeCap, 'offered', offered, raising=False)
+    monkeypatch.setattr(FakeCap, 'offered', offered)
     monkeypatch.setattr(source.cv2, 'VideoCapture', FakeCap)
     monkeypatch.setattr(source, 'v4l2_fps', lambda *a: list(offered))
     monkeypatch.setattr(source, 'lock_controls', lambda *a: {})

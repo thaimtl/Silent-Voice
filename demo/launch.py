@@ -299,7 +299,7 @@ class Part:
             return
         try:
             if WINDOWS:
-                self.proc.send_signal(signal.CTRL_BREAK_EVENT)
+                self.proc.send_signal(signal.CTRL_BREAK_EVENT)  # pylint: disable=no-member
             else:
                 os.killpg(self.proc.pid, signal.SIGINT)
             self.proc.wait(grace_s)

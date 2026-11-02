@@ -258,7 +258,7 @@ def main(argv=None):
                else float('nan') for k in LABELS}
         fresh, carry, rest = (float(np.mean([sc[i] for sc in scored])) for i in (1, 2, 3))
         objective = float(np.nanmean(list(acc.values()))) - 2 * fresh    # labels with no sentences are left out
-        if best is None or objective > best[0]:
+        if best is None or objective > best[0]:  # pylint: disable=unsubscriptable-object
             best = (objective, (margin, hold_s, tau_s), acc, fresh, carry, rest, scored)
     _, (margin, hold_s, tau_s), acc, fresh, carry, rest, scored = best
     how = 'each session scored by a head fitted on the others' if len(sessions) > 1 else 'held-out clips, 5-fold'
