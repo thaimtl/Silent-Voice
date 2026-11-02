@@ -31,7 +31,7 @@ class Reading:
     greedy: str
     enc_ms: float
     ctc_ms: float
-    enc: object = None
+    enc: torch.Tensor | None = None
     frontend_ms: float = 0.0
     conformer_ms: float = 0.0
 
