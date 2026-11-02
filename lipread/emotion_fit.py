@@ -13,12 +13,14 @@ import os
 import sys
 import time
 from collections import Counter
+from typing import NamedTuple
 
 import numpy as np
 
 import lipread
-from lipread.emotion import BASELINE_S
+from lipread.emotion import BASELINE_S, EmotionWorker, Hold
 from lipread.expression import HEAD_PATH, LOGITS, MODEL_SHA256, N_FEATURES, Head
+from lipread.source import ReplaySource, fit
 
 LABELS = ('neutral', 'happy', 'sad', 'surprised')
 TRUTH = {'smile': 'happy', 'frown': 'sad', 'surprised': 'surprised'}
@@ -26,7 +28,7 @@ REST = {'Smile': 'happy', 'Raise your eyebrows': 'surprised'}
 PROCESS = (1280, 720)
 GRID = list(itertools.product((0.4, 0.5, 0.6, 0.7), (0.5, 0.8), (0.3, 0.5, 1.0)))   # margin, hold_s, tau_s
 FEATURE_DIR = os.path.join(lipread.WORK, 'data', 'emotion')
-CACHE_VERSION = 3
+CACHE_VERSION = 4
 C_DEFAULT = 0.01     # strong: 10 clips per expression per session; best leave-one-session-out
 
 
@@ -42,6 +44,20 @@ def session_rows(root, session):
     return sorted(rows, key=lambda r: r['clip_t0'])
 
 
+class ClipFrame(NamedTuple):
+    recorder_t: float
+    image: np.ndarray
+
+
+def clip_frames(root, session, row, size=PROCESS):
+    src = ReplaySource(row['id'], realtime=False, root=os.path.join(root, session))
+    try:
+        for frame in src.frames():
+            yield ClipFrame(frame.t + src.t_offset, fit(frame, size).image)
+    finally:
+        src.close()
+
+
 def extract(root, session, cache=FEATURE_DIR):
     """Per clip (id, truth, is_rest, t (T,), feats (T, 60) with NaN rows where no face), cached per session."""
     path = os.path.join(cache, f'features_{session}.npz')
@@ -52,29 +68,20 @@ def extract(root, session, cache=FEATURE_DIR):
             and tuple(z['process']) == PROCESS and list(z['ids']) == [r['id'] for r in rows]
         if same:
             return [(r['id'], truth(r), bool(r.get('cue')), z[f't_{r["id"]}'], z[f'f_{r["id"]}']) for r in rows]
-    import cv2
     from lipread.crop import BlendTracker
-    from lipread.run import fit
-    from lipread.types import Frame
     from lipread.expression import ExpressionNet
     net = ExpressionNet(threads=os.cpu_count() or 2)
-    # one tracker per session, as live
     tracker = BlendTracker(os.path.join(lipread.LIPFLOW_MODELS, 'face_landmarker.task'))
     out, store, t0 = [], {}, time.time()
     for n, r in enumerate(rows):
-        ts = np.load(os.path.join(root, session, r['video_ts'])).astype(np.float64).reshape(-1)
-        cap = cv2.VideoCapture(os.path.join(root, session, r['video']))
-        feats = []
-        while len(feats) < len(ts):
-            ok, img = cap.read()
-            if not ok:
-                break
-            img = fit(Frame(t=ts[len(feats)], image=img, index=len(feats)), PROCESS).image    # as the crop thread
-            obs = tracker.detect(img, int(round(ts[len(feats)] * 1000)))
-            lg = None if obs is None or obs.blend is None else net.logits(img, obs.pts)
+        times, feats = [], []
+        for frame in clip_frames(root, session, r):
+            obs = tracker.detect(frame.image, int(round(frame.recorder_t * 1000)))
+            lg = None if obs is None or obs.blend is None else net.logits(frame.image, obs.pts)
             feats.append(np.full(N_FEATURES, np.nan, np.float32) if lg is None else np.concatenate([lg, obs.blend]))
-        cap.release()
-        t, f = ts[:len(feats)], np.array(feats, np.float32).reshape(-1, N_FEATURES)
+            times.append(frame.recorder_t)
+        t = np.asarray(times, np.float64)
+        f = np.asarray(feats, np.float32).reshape(-1, N_FEATURES)
         out.append((r['id'], truth(r), bool(r.get('cue')), t, f))
         store[f't_{r["id"]}'], store[f'f_{r["id"]}'] = t, f
         if n % 25 == 24:
@@ -136,19 +143,15 @@ def training_frames(clips, base):
 
 
 def replay(clips, probs, t_start, margin, hold_s, tau_s, hz=None):
-    """Published labels per frame from the live NetTagger.step, fed at EmotionWorker.NET_HZ."""
-    from lipread.emotion import EmotionWorker, NetTagger
     hz = hz or EmotionWorker.NET_HZ
-    head = Head(LABELS, np.zeros(N_FEATURES), np.ones(N_FEATURES), np.zeros((len(LABELS), N_FEATURES)),
-                np.zeros(len(LABELS)), margin, hold_s, tau_s)
-    tagger = NetTagger(net=None, head=head)
+    hold = Hold(LABELS, margin, hold_s, tau_s)
     label, last, res = 'neutral', None, []
     for (_, _, _, t, _), p in zip(clips, probs):
         labs = []
         for ti, pi in zip(t, p):
             if ti > t_start and (last is None or ti - last >= 1.0 / hz - 1e-9):
                 last = ti
-                label = tagger.step(ti, None if np.isnan(pi[0]) else pi).label
+                label = hold.step(ti, None if np.isnan(pi[0]) else pi).label
             labs.append(label)
         res.append(labs)
     return res

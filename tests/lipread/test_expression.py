@@ -248,7 +248,7 @@ def test_fit_head_survives_a_fold_without_a_label():
 
 
 def test_fit_replay_is_the_live_tagger():
-    """emotion_fit.replay drives NetTagger.step: a held smile switches after the hold, a face-less gap decays."""
+    """emotion_fit.replay drives Hold.step: a held smile switches after the hold, a face-less gap decays."""
     t = np.arange(0, 12, 1 / 30)
     p = np.tile(np.array([0.97, 0.01, 0.01, 0.01], np.float32), (len(t), 1))
     p[(t >= 4) & (t < 6)] = [0.02, 0.96, 0.01, 0.01]

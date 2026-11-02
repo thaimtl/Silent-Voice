@@ -16,6 +16,9 @@ log = logging.getLogger(__name__)
 CLASSES = ('Anger', 'Contempt', 'Disgust', 'Fear', 'Happiness', 'Neutral', 'Sadness', 'Surprise')
 # no head: AffectNet class -> bus label (the other three classes are dropped)
 GENERIC = {'Neutral': 'neutral', 'Happiness': 'happy', 'Sadness': 'sad', 'Anger': 'angry', 'Surprise': 'surprised'}
+GENERIC_MARGIN = 0.6
+GENERIC_HOLD_S = 0.5
+GENERIC_TAU_S = 1.0
 SIZE = 224
 MARGIN = 1.15
 MEAN = np.array([0.485, 0.456, 0.406], np.float32)

@@ -15,8 +15,9 @@ import lipread
 from bus import now, decode, encode, validate
 from lipread.endpoint import Segmenter
 from lipread.model import LiveModel, Reading
-from lipread.run import End, Runner, crop_thread, due_after, fit, make_source, parse_args, rebased, serve, shifted
+from lipread.run import End, Runner, crop_thread, due_after, make_source, parse_args, rebased, serve, shifted
 from bus import TIMING_KEYS, TOPK
+from lipread.source import fit
 from lipread.types import FPS, Crop, Frame
 
 from .conftest import needs_cuda, needs_sample, needs_weights

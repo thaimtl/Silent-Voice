@@ -29,7 +29,7 @@ import torch
 import lipread
 from bus import bus_text
 from lipread.model import FACE_ADAPTER_PREFIXES
-from lipread.source import RECORDINGS, ReplaySource
+from lipread.source import RECORDINGS, ReplaySource, fit
 
 DEFAULT_OUT = os.path.join(lipread.WORK, 'data', 'face_adapter', 'austin.pth')
 CROP_CACHE = os.path.join(lipread.WORK, 'data', 'face_adapter', 'crops')
@@ -62,7 +62,6 @@ def crops(row, face_model, process_size=(1280, 720), root=RECORDINGS, cache=CROP
     """(T, 96, 96) uint8 mouth crops at 25 fps of one recording, as the live reader makes them (cached in cache/,
     None: no cache)."""
     from lipread.crop import LiveCropper
-    from lipread.run import fit
     path = cache and os.path.join(cache, f"{row['id']}_{process_size[0]}x{process_size[1]}.npy")
     if path and os.path.exists(path):
         return np.load(path)

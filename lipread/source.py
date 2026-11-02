@@ -29,6 +29,7 @@ import subprocess
 import sys
 import threading
 from collections import deque
+from dataclasses import replace
 
 import cv2
 import numpy as np
@@ -47,6 +48,15 @@ SLOW_FPS = 28
 # Windows DirectShow (OpenCV 5): grab() returns at once and retrieve() waits for the frame, so a grab-only loop spins
 # and stamps frames before they arrive. There every frame is read, and stamped once it is in.
 READ_EVERY_FRAME = sys.platform == 'win32'
+
+
+def fit(frame, size):
+    h, w = frame.image.shape[:2]
+    if size is None or (w <= size[0] and h <= size[1]):
+        return frame
+    k = min(size[0] / w, size[1] / h)
+    img = cv2.resize(frame.image, (round(w * k), round(h * k)), interpolation=cv2.INTER_AREA)
+    return replace(frame, image=img)
 
 
 class Resampler:

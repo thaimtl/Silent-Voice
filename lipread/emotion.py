@@ -10,6 +10,7 @@ from types import SimpleNamespace
 import numpy as np
 
 from bus import EMOTIONS, Emotion
+from lipread.expression import GENERIC, GENERIC_HOLD_S, GENERIC_MARGIN, GENERIC_TAU_S, generic_probs
 from lipread.types import FPS
 
 log = logging.getLogger(__name__)
@@ -190,7 +191,6 @@ class RunningBaseline:
         self.buf, self.base, self.t_update, self.n = deque(), None, -math.inf, 0
 
     def expressive(self, feats):
-        from lipread.expression import GENERIC, generic_probs
         return 1.0 - generic_probs(feats[:8])[list(GENERIC).index('Neutral')] > self.gate
 
     def push(self, t, feats):
@@ -206,55 +206,27 @@ class RunningBaseline:
         return self.base
 
 
-class NetTagger:
-    """Expression network -> Emotion, with EmotionTagger's hold and no-face decay and a RunningBaseline."""
-
-    GENERIC_SMOOTHING = (0.6, 0.5, 1.0)     # margin, hold_s, tau_s: best on RAVDESS without a head
-
-    def __init__(self, net, head=None, baseline_s=BASELINE_S, labels=EMOTIONS, window_s=BASELINE_WINDOW_S):
-        from lipread.expression import GENERIC
-        self.net, self.head, self.labels = net, head, tuple(labels)
-        self.baseline = RunningBaseline(window_s=window_s, warm_s=baseline_s)
-        self.own = head.labels if head else tuple(GENERIC.values())
-        self.margin, self.hold_s, self.tau = (head.margin, head.hold_s, head.tau_s) if head else self.GENERIC_SMOOTHING
+class Hold:
+    def __init__(self, own, margin, hold_s, tau, labels=EMOTIONS):
+        self.own, self.labels = tuple(own), tuple(labels)
+        self.margin, self.hold_s, self.tau = margin, hold_s, tau
         if NEUTRAL not in self.own or NEUTRAL not in self.labels:
             raise ValueError(f'{NEUTRAL!r} must be a label of the head and of the bus')
-        self.reset_baseline()
+        self.reset()
 
-    def reset_baseline(self):
-        self.baseline.reset()
+    def reset(self):
         self.smooth = None
         self.label, self.cand, self.cand_since, self.t = NEUTRAL, NEUTRAL, None, None
 
-    @property
-    def base(self):
-        return self.baseline.base
+    def stamp(self, t):
+        self.t = float(t)
+        return self._emit()
 
-    def _probs(self, feats):
-        from lipread.expression import generic_probs
-        x = feats - self.base
-        if self.head:
-            return self.head.predict(x)[0]
-        return generic_probs(x[:8])
-
-    def push(self, t, image, face):
-        """One processed frame: run the network on the face (if any), then push_features."""
-        feats = None
-        if face is not None and face[2] is not None:
-            logits = self.net.logits(image, face[1])
-            if logits is not None:
-                feats = np.concatenate([logits, np.asarray(face[2], np.float32)])
-        return self.push_features(t, feats)
-
-    def push_features(self, t, feats):
-        """[8 logits, 52 blendshapes] or None (no face): the running baseline, then step() with the probabilities."""
-        if self.baseline.push(t, feats) is None:
-            self.t = float(t)
-            return self._emit()
-        return self.step(t, None if feats is None else self._probs(feats))
+    def _restart_pending_switch(self):
+        self.cand, self.cand_since = self.label, None
 
     def step(self, t, probs):
-        """Probabilities over self.own, or None for no face -> Emotion. emotion_fit drives this directly."""
+        """Probabilities over self.own, or None for no face -> Emotion."""
         t = float(t)
         dt = 1.0 / FPS if self.t is None else min(MAX_DT, max(0.0, t - self.t))
         self.t = t
@@ -273,7 +245,7 @@ class NetTagger:
             if cand != self.label and t - self.cand_since >= self.hold_s - 1e-9:
                 self.label = cand
         else:
-            self.cand, self.cand_since = self.label, None     # no face: a pending switch starts its hold again
+            self._restart_pending_switch()
             if self.label != NEUTRAL and self.smooth[self.own.index(self.label)] < self.margin / 2:
                 self.label = self.cand = NEUTRAL
         return self._emit()
@@ -291,6 +263,51 @@ class NetTagger:
         return Emotion(self.label, scores[self.label], scores)
 
 
+class NetTagger:
+    """Expression network -> Emotion, through a Hold and a RunningBaseline."""
+
+    def __init__(self, net, head=None, baseline_s=BASELINE_S, labels=EMOTIONS, window_s=BASELINE_WINDOW_S):
+        self.net, self.head, self.labels = net, head, tuple(labels)
+        self.baseline = RunningBaseline(window_s=window_s, warm_s=baseline_s)
+        if head is not None:
+            own = head.labels
+            margin, hold_s, tau = head.margin, head.hold_s, head.tau_s
+        else:
+            own = tuple(GENERIC.values())
+            margin, hold_s, tau = GENERIC_MARGIN, GENERIC_HOLD_S, GENERIC_TAU_S
+        self.hold = Hold(own, margin, hold_s, tau, self.labels)
+        self.reset_baseline()
+
+    def reset_baseline(self):
+        self.baseline.reset()
+        self.hold.reset()
+
+    @property
+    def base(self):
+        return self.baseline.base
+
+    def _probs(self, feats):
+        x = feats - self.base
+        if self.head:
+            return self.head.predict(x)[0]
+        return generic_probs(x[:8])
+
+    def push(self, t, image, face):
+        """One processed frame: run the network on the face (if any), then push_features."""
+        feats = None
+        if face is not None and face[2] is not None:
+            logits = self.net.logits(image, face[1])
+            if logits is not None:
+                feats = np.concatenate([logits, np.asarray(face[2], np.float32)])
+        return self.push_features(t, feats)
+
+    def push_features(self, t, feats):
+        """[8 logits, 52 blendshapes] or None (no face): the running baseline, then the hold."""
+        if self.baseline.push(t, feats) is None:
+            return self.hold.stamp(t)
+        return self.hold.step(t, None if feats is None else self._probs(feats))
+
+
 class EmotionWorker:
     """submit() from the crop thread (never raises), current() for cam.tick. sync=True: net runs inline (replays)."""
 
@@ -300,7 +317,7 @@ class EmotionWorker:
     JOIN_S = 1.0
 
     def __init__(self, net='auto', head='auto', sync=False):
-        self.tagger = EmotionTagger()
+        self.tagger = None
         self.emotion = RESTING
         self.failed = False
         self.sync = sync
@@ -314,7 +331,9 @@ class EmotionWorker:
             self.net_tagger = self._make_net(net, head)
         except Exception:  # noqa: BLE001
             log.exception('expression network failed to start: rule tagger only')
-        if self.net_tagger is not None and not sync:
+        if self.net_tagger is None:
+            self.tagger = EmotionTagger()
+        elif not sync:
             self._thread = threading.Thread(target=self._net_loop, name='emotion-net', daemon=True)
             self._thread.start()
 
@@ -336,13 +355,13 @@ class EmotionWorker:
         return NetTagger(net, head)
 
     def submit(self, t, image, face):
-        try:
-            self.emotion = self.tagger.push(SimpleNamespace(t=t, blend=None if face is None else face[2]))
-        except Exception:  # noqa: BLE001
-            if not self.failed:
-                self.failed = True
-                log.exception('emotion failed (logged once; the lip reader goes on)')
         if self.net_tagger is None:
+            try:
+                self.emotion = self.tagger.push(SimpleNamespace(t=t, blend=None if face is None else face[2]))
+            except (AttributeError, TypeError, ValueError, IndexError, KeyError):
+                if not self.failed:
+                    self.failed = True
+                    log.exception('emotion failed (logged once; the lip reader goes on)')
             return
         if self.sync:
             if self._last_t is None or t - self._last_t >= 1.0 / self.NET_HZ - 1e-9:
@@ -377,7 +396,8 @@ class EmotionWorker:
             self._stop.wait(max(0.0, started + period - time.monotonic()))
 
     def reset_baseline(self):
-        self.tagger.reset_baseline()
+        if self.tagger is not None:
+            self.tagger.reset_baseline()
         if self.net_tagger is not None:
             with self._lock:
                 self.net_tagger.reset_baseline()

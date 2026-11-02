@@ -49,7 +49,6 @@ import threading
 import time
 from dataclasses import asdict, dataclass
 
-import cv2
 import numpy as np
 
 import lipread
@@ -58,6 +57,7 @@ from lipread.crop import LiveCropper
 from lipread.emotion import RESTING, EmotionWorker
 from lipread.endpoint import START, Segmenter
 from bus import CamTick
+from lipread.source import fit
 from lipread.types import FPS, Frame
 
 log = logging.getLogger('lipread.run')
@@ -220,16 +220,6 @@ def size_arg(s):
     if w <= 0 or h <= 0:
         raise argparse.ArgumentTypeError(f'{s!r}: positive sizes expected')
     return w, h
-
-
-def fit(frame, size):
-    """The frame shrunk (INTER_AREA, aspect kept) to fit size = (w, h); unchanged if it fits or size is None."""
-    h, w = frame.image.shape[:2]
-    if size is None or (w <= size[0] and h <= size[1]):
-        return frame
-    k = min(size[0] / w, size[1] / h)
-    img = cv2.resize(frame.image, (round(w * k), round(h * k)), interpolation=cv2.INTER_AREA)
-    return dataclasses.replace(frame, image=img)
 
 
 def crop_thread(source, cropper, q, stop, emotion=None, rebase=False, process_size=None, face_pub=None, face_every=2,
