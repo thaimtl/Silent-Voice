@@ -4,6 +4,9 @@
     venv-svr/bin/python -m fusion.run --calibrate 60        # first 60 s of emg.raw (Austin mouthing) refit the gains
     venv-svr/bin/python -m fusion.run --no-emg              # camera + LM + Claude only (pads off)
 
+Without --calibrate, the last calibration's gains are reused (data/fusion/calibration.json, saved by each
+--calibrate run): right while the pads stay where they were; after re-padding, calibrate again.
+
 Connects to 'cam' (cam.tick, cam.final), 'emg' (emg.raw), 'claude' (claude.predict, claude.repair) and 'call'
 (partner.text); binds 'dec' (bus/team.py). The logic is fusion/core.py; this file only moves messages. Messages are
 drained before each pass, and a cam.tick with a newer one of the same segment already waiting is skipped, so a slow
@@ -14,6 +17,7 @@ data/lexicon/cmudict.dict (look-alikes), data/fusion/params.json (python -m fusi
 without it the unfitted defaults run), and the camera's units file and SentencePiece model in third_party/.
 """
 import argparse
+import json
 import os
 import signal
 import sys
@@ -26,8 +30,12 @@ from bus.team import Pub, Sub
 from fusion.offline import PARAMS, WORK, build_search, load_params
 
 DEFAULT_SVR = os.path.join(WORK, 'checkpoints', 'W_s12_svr1_4ch', 'model.pt')
+CALIBRATION = os.path.join(WORK, 'data', 'fusion', 'calibration.json')
 TOPICS = ['cam.tick', 'cam.final', 'emg.raw', 'claude.predict', 'claude.repair', 'claude.end', 'partner.text']
 STEP_S = 0.02
+# Claude's hints, live: a hint adds DEFAULT_BETA x its weight (0 to 1) to a candidate's score. 1.0, as in
+# params.json (never fitted: fusion/offline.py runs without Claude); --beta raises it.
+DEFAULT_BETA = 1.0
 
 
 def drain(sub, first):
@@ -54,7 +62,24 @@ def calibrate(live, sub, seconds):
             raw.append(np.asarray(msg['samples']).reshape(-1, 4))
     if not raw:
         sys.exit('fusion: no emg.raw arrived: is rig/publish.py running?')
-    print(f'fusion: calibration {live.calibrate(np.concatenate(raw))}', file=sys.stderr)
+    fit = live.calibrate(np.concatenate(raw))
+    print(f'fusion: calibration {fit}', file=sys.stderr)
+    os.makedirs(os.path.dirname(CALIBRATION), exist_ok=True)
+    with open(CALIBRATION, 'w') as f:
+        json.dump({**fit, 'saved': time.strftime('%Y-%m-%d %H:%M')}, f)
+
+
+def last_calibration(live, path=CALIBRATION):
+    """The last --calibrate run's gains and references; without one, the fine-tuning session's stay."""
+    try:
+        with open(path) as f:
+            fit = json.load(f)
+    except (OSError, ValueError):
+        print(f"fusion: no saved calibration ({path}): the fine-tuning session's gains", file=sys.stderr)
+        return
+    live.gain = np.asarray(fit['gain'], np.float32)
+    live.effort_ref, live.pace_ref = fit['effort_ref'], fit['pace_ref']
+    print(f"fusion: reusing the last calibration, from {fit.get('saved', '?')}", file=sys.stderr)
 
 
 def main():
@@ -64,19 +89,23 @@ def main():
     ap.add_argument('--repair-s', type=float, default=0.0,
                     help="wait before a locked word is spoken (default 0: Claude's repairs fix the captions only, so "
                          "waiting buys nothing; each 0.1 s here is 0.1 s on every word)")
+    ap.add_argument('--beta', type=float, default=DEFAULT_BETA,
+                    help="weight of Claude's hints in the joint search (a hint adds beta x its weight, 0 to 1)")
     ap.add_argument('--tau0', type=float, default=None, help="lock threshold at predictability 0 (default: fitted)")
     ap.add_argument('--tau-end', type=float, default=None, help="end-of-sentence lock threshold (before cam.final)")
     ap.add_argument('--repeat-floor', type=float, default=None,
                     help='Please repeat only when the sentence confidence is below this (0: never; default: fitted)')
     ap.add_argument('--no-emg', action='store_true', help='camera + LM + Claude only')
     ap.add_argument('--no-claude', action='store_true', help="ignore Claude's predictions and repairs")
-    ap.add_argument('--calibrate', type=float, default=0.0, metavar='S', help='refit the EMG gains on the first S s')
+    ap.add_argument('--calibrate', type=float, default=0.0, metavar='S',
+                    help='refit the EMG gains on the first S s and save them (default: reuse the last saved ones)')
     ap.add_argument('--sub', action='append', default=[], help='endpoints to connect to (default cam emg claude call)')
     ap.add_argument('--pub', default='dec')
     args = ap.parse_args()
 
     from fusion.core import Fusion
     gate, lock, meta = load_params(args.params)
+    gate.beta = args.beta   # set here, so the launcher needs no flag
     if args.tau0 is not None:   # keep the fitted range's shape around the new threshold
         lock.tau_min, lock.tau_max = lock.tau_min + args.tau0 - lock.tau0, min(0.99, lock.tau_max + args.tau0 - lock.tau0)
         lock.tau0 = args.tau0
@@ -96,6 +125,8 @@ def main():
     pub = Pub(args.pub)
     if live is not None and args.calibrate > 0:
         calibrate(live, sub, args.calibrate)
+    elif live is not None:
+        last_calibration(live)
     core = Fusion(search, gate, lock, svr=live, repair_s=args.repair_s, use_hints=not args.no_claude)
     signal.signal(signal.SIGTERM, signal.default_int_handler)
     print(f'fusion: running (EMG {"off" if live is None else os.path.basename(os.path.dirname(args.svr))}, '

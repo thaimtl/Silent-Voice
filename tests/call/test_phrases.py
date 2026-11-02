@@ -61,13 +61,16 @@ def test_trim_keeps_the_speech_and_a_natural_pause():
 
 # --- the phrase policy -----------------------------------------------------------------------------------------------
 def test_phrase_policy():
-    assert phrase_ready(['THEY', 'LOST']) == 0                    # wait for more, or for his pause
-    assert phrase_ready(['I', 'GOT', 'HOME'], spoken=0) == 3     # a sentence's first phrase goes sooner
-    assert phrase_ready(['I', 'NEED', 'MY'], spoken=0) == 0
-    assert phrase_ready(['THEY', 'LOST', 'MY', 'BAG']) == 4
-    assert phrase_ready(['I', 'HAD', 'TO', 'WAIT']) == 4
-    assert phrase_ready(['SO', 'I', 'HAD', 'TO']) == 0           # never end on a function word ...
-    assert phrase_ready(['SO', 'I', 'HAD', 'TO', 'THE', 'A']) == 6     # ... but never hold more than 6
+    assert phrase_ready(['THEY', 'LOST']) == 0                    # wait for his pause
+    assert phrase_ready(['I', 'GOT', 'HOME'], spoken=0) == 0     # no cut while he keeps mouthing ...
+    assert phrase_ready(['THEY', 'LOST', 'MY', 'BAG']) == 4       # ... but never hold more than 4
+    assert phrase_ready(['SO', 'I', 'HAD', 'TO', 'THE']) == 5
+
+
+async def pause(v, utt_id):
+    """His decoder shows nothing in his mouth: he paused, the phrase goes."""
+    v.mouthing(utt_id, False)
+    await asyncio.sleep(cv.PHRASE_PAUSE_S + 0.05)
 
 
 # --- the voice with a fake Sonic -------------------------------------------------------------------------------------
@@ -146,22 +149,21 @@ def phrases(timing):
     return [r['words'] for r in timing if r['stage'] == 'voice_phrase' and not r.get('fallback')]
 
 
-async def test_words_go_as_phrases_at_his_pauses_and_every_four_words():
+async def test_words_go_as_phrases_at_his_pauses():
     v, conn, heard, timing, _ = await make()
     for w in ['YES']:
         await v.say(1, [w])
-    v.mouthing(1, False)                                         # his decoder: nothing in his mouth, he paused
-    await asyncio.sleep(cv.PHRASE_PAUSE_S + 0.05)
-    for w in ['THEY', 'LOST', 'MY', 'BAG']:                       # four words: a phrase without waiting
+    await pause(v, 1)
+    for w in ['THEY', 'LOST', 'MY']:                              # he keeps mouthing: no cut ...
         await v.say(1, [w])
         v.mouthing(1, True)
-    await v.say(1, ['AT'])
+    await v.say(1, ['AT'])                                       # ... until PHRASE_MAX words wait
     await v.say(1, ['THE', 'AIRPORT'], final=True)
     await asyncio.sleep(0.3)
     ctx = conn.contexts[0]
     assert ctx.defaults['output_format'] == PCM and ctx.defaults['max_buffer_delay_ms'] == 0
-    assert ctx.pushed == [('Yes,', True), (' they lost my bag', True), (' at the airport.', True)]   # his pause: ','
-    assert phrases(timing) == ['YES', 'THEY LOST MY BAG', 'AT THE AIRPORT']
+    assert ctx.pushed == [('Yes,', True), (' they lost my at', True), (' the airport.', True)]   # his pause: ','
+    assert phrases(timing) == ['YES', 'THEY LOST MY AT', 'THE AIRPORT']
     for r in timing:                                             # each phrase: its speech and a short pause, not 0.5 s
         if r['stage'] == 'voice_phrase':
             assert abs(r['ms'] / 1000 - (0.3 + audio.PRE_S + cv.PHRASE_TAIL_S)) < 0.02
@@ -171,16 +173,25 @@ async def test_words_go_as_phrases_at_his_pauses_and_every_four_words():
 
 async def test_a_word_in_his_mouth_keeps_the_phrase_open():
     v, conn, _, _, _ = await make()
-    await v.say(2, ['I', 'NEED', 'HELP'])                        # the first phrase: three words, at once
-    await v.say(2, ['MY', 'PILLS'])
-    for _ in range(4):                                           # dec.hyp every 100 ms: he is mouthing the next word
-        v.mouthing(2, True)
+    await v.say(2, ['I', 'NEED'])
+    await v.say(2, ['MY', 'PILLS'][:1])
+    for _ in range(8):                                           # dec.hyp every 100 ms: he is mouthing the next word,
+        v.mouthing(2, True)                                      # longer than PHRASE_IDLE_S
         await asyncio.sleep(0.1)
-    assert conn.contexts[0].pushed == [('I need help', True)]    # nothing more while he is mid-phrase
+    assert conn.contexts == []                                   # nothing while he is mid-phrase
     for _ in range(3):                                           # then he pauses; dec.hyp keeps saying so
         v.mouthing(2, False)
         await asyncio.sleep(0.1)
-    assert conn.contexts[0].pushed == [('I need help', True), (' my pills,', True)]  # repeats: pause not pushed back
+    assert conn.contexts[0].pushed == [('I need my,', True)]     # repeats: pause not pushed back
+    await v.close()
+
+
+async def test_a_long_stretch_without_a_pause_goes_at_four_words():
+    v, conn, _, _, _ = await make()
+    for w in 'I THINK WE SHOULD GET LUNCH AFTER'.split():
+        await v.say(3, [w])
+        v.mouthing(3, True)
+    assert [p for p, _ in conn.contexts[0].pushed] == ['I think we should']
     await v.close()
 
 
@@ -217,6 +228,7 @@ async def test_a_face_held_mid_sentence_splits_it(monkeypatch):
     v, conn, _, _, _ = await make()
     v.set_emotion('happy', 0.9)
     await v.say(5, ['I', 'GOT', 'THE', 'JOB'])
+    await pause(v, 5)
     v.set_emotion('sad', 0.9)
     await v.say(5, ['BUT'])                                      # too soon: still the happy recording
     await asyncio.sleep(0.15)
@@ -233,6 +245,7 @@ async def test_a_change_of_face_mid_sentence_starts_a_fresh_recording(monkeypatc
     v, conn, heard, timing, _ = await make()
     v.set_emotion('happy', 0.9)
     await v.say(5, ['I', 'GOT', 'THE', 'JOB'])
+    await pause(v, 5)
     await v.say(5, ['AND', 'I'])                                 # still happy: waits for more words
     v.set_emotion('sad', 0.9)
     await v.say(5, ['WILL', 'MISS', 'YOU'], final=True)
@@ -251,11 +264,12 @@ async def test_a_clench_inside_a_phrase_is_loud_on_that_word_only():
     v, conn, _, _, _ = await make()
     await v.say(8, ['I', 'TOLD'], effort=1.0)
     await v.say(8, ['THEM'], effort=1.0)
+    await pause(v, 8)
     await v.say(8, ['TODAY'], effort=1.9)                         # he clenches on "today"
     await v.say(8, ['NOT', 'TOMORROW'], effort=1.0, final=True)
     await asyncio.sleep(0.2)
     pushed = [p for p, _ in conn.contexts[0].pushed]
-    assert pushed == ['I told them', ' <volume ratio="1.90"/> today <volume ratio="1.00"/> not tomorrow.']
+    assert pushed == ['I told them,', ' <volume ratio="1.90"/> today <volume ratio="1.00"/> not tomorrow.']
     await v.close()
 
 
@@ -288,8 +302,10 @@ async def test_a_sonic_error_mid_sentence_never_shifts_words_onto_the_wrong_audi
             self.contexts.append(c)
             return c
     v, conn, _, timing, fallback = await make(ErrConn())
-    await v.say(6, ['THEY', 'LOST', 'MY', 'BAG'])                # the first phrase (2+ words): sent whole
+    await v.say(6, ['THEY', 'LOST', 'MY', 'BAG'])                # the first phrase: sent whole at his pause
+    await pause(v, 6)
     await v.say(6, ['AT', 'THE', 'BIG', 'AIRPORT'])
+    await pause(v, 6)
     await asyncio.sleep(0.3)
     await v.say(6, ['SO', 'I', 'WAITED'], final=True)
     await asyncio.sleep(0.5)
@@ -300,13 +316,13 @@ async def test_a_sonic_error_mid_sentence_never_shifts_words_onto_the_wrong_audi
 
 async def test_a_reconnect_mid_sentence_sends_unanswered_phrases_to_the_fallback():
     v, conn, _, timing, fallback = await make()
-    await v.say(7, ['I', 'NEED', 'MY', 'PILLS'])                  # no audio yet when the socket drops
+    await v.say(7, ['I', 'NEED', 'MY', 'PILLS', 'RIGHT', 'NOW'])  # six words: sent; no audio yet when the socket drops
     dead = iter([False])
     v._alive = lambda: next(dead, True)
-    await v.say(7, ['RIGHT', 'NOW'], final=True)                 # reconnects first
+    await v.say(7, ['PLEASE'], final=True)                       # reconnects first
     await asyncio.sleep(0.5)
-    assert phrases(timing) == []                                 # "right now" never plays before "I need my pills"
-    assert fallback == ['I need my pills right now.']            # not lost, in order
+    assert phrases(timing) == []                                 # "please" never plays before "I need my pills"
+    assert fallback == ['I need my pills right now please.']     # not lost, in order
     await v.close()
 
 
@@ -315,9 +331,9 @@ async def test_his_face_and_pauses_write_the_punctuation():
     v, conn, _, _, _ = await make()
     v.set_emotion('happy', 0.9)
     await v.say(1, ['I', 'GOT', 'THE', 'JOB'])
+    await pause(v, 1)
     await v.say(1, ['I', 'START'])
-    v.mouthing(1, False)
-    await asyncio.sleep(cv.PHRASE_PAUSE_S + 0.05)
+    await pause(v, 1)
     await v.say(1, ['MONDAY'], final=True)
     v.set_emotion('neutral', 0.9)
     await v.say(2, ['WHERE', 'IS', 'IT'], final=True)
@@ -329,14 +345,14 @@ async def test_his_face_and_pauses_write_the_punctuation():
 
 async def test_a_question_waits_for_his_pause_so_it_can_rise():
     v, conn, _, _, _ = await make()
-    for w in ['WHERE', 'IS', 'MY', 'BAG']:                       # four words: no early cut for a question
+    for w in ['WHERE', 'IS', 'HE']:                              # no early cut for a question
         await v.say(1, [w])
     assert conn.contexts == []
     v.mouthing(1, False)
     await asyncio.sleep(cv.PHRASE_PAUSE_S + 0.05)
     await v.say(1, [], final=True)                               # an empty final: no bare '?' pushed after
     await asyncio.sleep(0.1)
-    assert [p for p, _ in conn.contexts[0].pushed] == ['Where is my bag?']
+    assert [p for p, _ in conn.contexts[0].pushed] == ['Where is he?']
     await v.close()
 
 
@@ -350,6 +366,7 @@ async def test_a_sentence_split_by_a_face_change_is_reported_played_once(monkeyp
     v.on_done = on_done
     v.set_emotion('happy', 0.9)
     await v.say(5, ['I', 'GOT', 'THE', 'JOB'])
+    await pause(v, 5)
     v.set_emotion('sad', 0.9)
     await v.say(5, ['BUT', 'I', 'MISS', 'YOU'], final=True)
     await asyncio.sleep(0.4)
@@ -390,7 +407,7 @@ async def test_have_a_great_day_is_not_a_question():
     await v.say(1, ['FRIEND'], final=True)
     await asyncio.sleep(0.2)
     pushed = [p for p, _ in conn.contexts[0].pushed]
-    assert pushed[0] == 'Have a great' and pushed[-1].endswith('!') and '?' not in ''.join(pushed)
+    assert pushed == ['Have a great day!', ' friend!']         # exclamations, not a question
     await v.close()
 
 

@@ -81,6 +81,7 @@ class CallState:
         self.utts = {}                       # utt_id -> Austin's sentence as it builds
         self.cur_utt = None
         self.repairs, self.repeats = [], []
+        self.captions_fixed = 0     # sentences whose caption Opus rewrote (claude.caption)
         self.last_repeat = None
         self.lat = dict(read=deque(maxlen=200), lock=deque(maxlen=200), claude=deque(maxlen=200),
                         window=deque(maxlen=200), sonic=deque(maxlen=200), lips_to_voice=deque(maxlen=200))
@@ -190,6 +191,22 @@ class CallState:
             self.repairs.append(dict(utt_id=u['utt_id'], index=int(e['index']), frm=pretty([frm], False),
                                      to=pretty([to], False)))
 
+    def _caption(self, topic, msg, now):
+        """claude.caption: Opus's corrected sentence replaces the caption (the voice already said what locked)."""
+        self.seen['claude'] = now
+        words = [str(w) for w in msg.get('words') or [] if str(w).strip()]
+        if not words or not msg.get('changed', True):
+            return
+        u = self._utt(msg['utt_id'], now)
+        u['caption'] = words
+        for line in reversed(self.transcript):
+            if line.get('who') == 'austin' and line.get('utt_id') == u['utt_id']:
+                self.captions_fixed += not line.get('caption_fixed')     # a retried pass counts once
+                line.setdefault('original', line['text'])
+                line['text'] = pretty(words)
+                line['caption_fixed'] = True
+                break
+
     def _say(self, topic, msg, now):
         u = self._utt(msg['utt_id'], now)
         words = [str(w) for w in msg.get('words') or []]
@@ -211,7 +228,7 @@ class CallState:
         if u['final']:
             return
         u['final'], u['t_final'] = True, t
-        text = self._said(u) or pretty(u['locked'])
+        text = pretty(u['caption']) if u.get('caption') else (self._said(u) or pretty(u['locked']))
         if text:
             emotion = u['emotion'] or self.emotion[0]
             self._line(dict(who='austin', text=text, t=t, utt_id=u['utt_id'], emotion=emotion,
@@ -386,7 +403,7 @@ class CallState:
         snap = dict(
             mode={'waiting': 'waiting', 'connected': 'live', 'ended': 'end'}[c['state']],
             number=self.number, channel=self.channel, switchable=self.switchable, elapsed=elapsed,
-            metrics=dict(lips_to_voice=_median(self.lat['lips_to_voice']), fixed=len(self.repairs),
+            metrics=dict(lips_to_voice=_median(self.lat['lips_to_voice']), fixed=len(self.repairs) + self.captions_fixed,
                          repeats=len(self.repeats)),
             judge_live=self.judge_live, transcript=self._recent(),
             austin=self._sentence(cur, now),
@@ -445,6 +462,6 @@ class CallState:
 HANDLERS = {
     'call.state': CallState._call_state, 'partner.text': CallState._partner,
     'dec.hyp': CallState._hyp, 'dec.lock': CallState._lock, 'dec.repeat': CallState._repeat,
-    'claude.repair': CallState._repair, 'voice.say': CallState._say,
+    'claude.repair': CallState._repair, 'claude.caption': CallState._caption, 'voice.say': CallState._say,
     'cam.tick': CallState._tick, 'cam.face': CallState._face_msg, 'emg.raw': CallState._emg,
 }

@@ -5,8 +5,8 @@ while Austin is still mouthing. Every chunk carries a leading space after the fi
 punctuation, so Sonic joins them as one sentence, in one continuous recording.
 
 Phrases (the default, CARTESIA_PACED=1): Sonic sounds natural only with a few words at once, so locked words go as
-phrases, each its own flush, cut at his pauses (dec.hyp) or every PHRASE_WORDS words. Sonic's padding is trimmed
-(call/audio.py) and each phrase plays as soon as it arrives.
+phrases, each its own flush, cut at his pauses (dec.hyp), never while he keeps mouthing unless PHRASE_MAX words wait.
+Sonic's padding is trimmed (call/audio.py) and each phrase plays as soon as it arrives.
 
 Unpaced (CARTESIA_PACED=0): audio is played as it arrives, with the server buffer CARTESIA_MAX_BUFFER_MS, and
 optionally words grouped client-side (CARTESIA_PHRASE_WORDS=3 with CARTESIA_MAX_BUFFER_MS=0).
@@ -51,9 +51,9 @@ FACE_HOLD_S = 0.8           # a new face must hold this long to split a sentence
 SPEED_BIAS = 1.1            # speech plays about as fast as Austin mouths; 10% faster keeps the voice up with him
 FIRST_WORDS, NEXT_WORDS, MAX_WORDS = 2, 3, 5
 PAUSE_S = 0.5               # Austin stopped mouthing for this long: speak what is waiting
-PHRASE_FIRST = 3            # phrases: a sentence's first phrase goes after this many words (it starts sooner);
-PHRASE_WORDS = 4            # later ones after this many (none ending on a function word) ...
-PHRASE_MAX = 6              # ... and never holds more than this
+# phrases go at his pauses only: a 3- then 4-word cut while he kept mouthing held 56% of the words, the first word of a
+# sentence 1.4 s (logs/20261025-072828-demo); a long stretch without a pause still goes at PHRASE_MAX words
+PHRASE_MAX = 4
 PHRASE_PAUSE_S = 0.05       # phrases: his decoder shows nothing being mouthed for this long: he paused, send
 PHRASE_IDLE_S = 0.6         # phrases: no new word and no word in his mouth for this long: send (no dec.hyp either)
 PHRASE_TAIL_S = 0.15        # the pause kept after each phrase (Sonic pads it with ~0.5 s)
@@ -127,12 +127,10 @@ def ready(pending, spoken, phrase_words=1):
 
 
 def phrase_ready(pending, spoken=1):
-    """Phrases: how many pending words to send now without waiting for a pause (0: wait)."""
+    """Phrases: how many pending words to send now without waiting for a pause (0: wait). Only PHRASE_MAX words: he
+    kept mouthing that long without a pause."""
     n = len(pending)
-    need = PHRASE_FIRST if not spoken else PHRASE_WORDS
-    if n >= PHRASE_MAX or (n >= need and pending[-1].lower() not in FUNCTION_WORDS):
-        return n
-    return 0
+    return n if n >= PHRASE_MAX else 0
 
 
 class Flush:
@@ -299,10 +297,8 @@ class Voice:
             if final:
                 await self._finish(u)
                 return
-            if self.cfg.paced:              # a question waits for his pause, up to PHRASE_MAX words
-                q = is_question(u.sent)
-                n = (len(u.pending) if len(u.pending) >= PHRASE_MAX else 0) if q else \
-                    phrase_ready(u.pending, u.spoken)
+            if self.cfg.paced:              # a phrase waits for his pause, up to PHRASE_MAX words
+                n = phrase_ready(u.pending, u.spoken)
             else:
                 n = ready(u.pending, u.spoken, self.cfg.phrase_words)
             if n:
@@ -368,7 +364,7 @@ class Voice:
             text += end_mark(u.sent, (gen or {}).get('emotion'))
         elif self.cfg.paced and is_question(u.sent):
             text += '?' if pause else ''    # a question rises where he pauses (most often its end)
-        elif self.cfg.paced and (gen or {}).get('emotion') in EXCLAIM and (pause or len(words) >= PHRASE_WORDS):
+        elif self.cfg.paced and (gen or {}).get('emotion') in EXCLAIM and (pause or len(words) >= PHRASE_MAX):
             text += '!'                     # an excited face exclaims at his pauses and full phrases (decided now)
         elif pause and self.cfg.paced:
             text += ','                     # his pause: a comma, so the voice breathes where he did

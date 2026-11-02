@@ -398,6 +398,8 @@ def parse_args(argv=None):
     ap.add_argument('--cam', type=int, default=0)
     ap.add_argument('--camera-settings', action='store_true',
                     help="open the webcam driver's settings dialog at start (Windows: lock exposure and focus there)")
+    ap.add_argument('--exposure', type=float, default=None,
+                    help='manual webcam exposure (DirectShow: log2 seconds, auto settles near -6; default auto)')
     ap.add_argument('--size', type=size_arg, default=(1920, 1080), metavar='WxH', help='webcam capture size')
     ap.add_argument('--process-size', type=lambda s: None if s == '0' else size_arg(s), default=(1280, 720),
                     metavar='WxH',
@@ -429,7 +431,7 @@ def make_source(args):
     if args.replay:
         return ReplaySource(args.replay, args.start, args.end, realtime=args.realtime)
     w, h = args.size
-    return CameraSource(args.cam, width=w, height=h, settings=args.camera_settings)
+    return CameraSource(args.cam, width=w, height=h, exposure=args.exposure, settings=args.camera_settings)
 
 
 def main(argv=None):

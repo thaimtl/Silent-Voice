@@ -121,7 +121,8 @@ class Service:
                 elif topic == bus.VOICE_SAY:
                     self.says.put_nowait(msg)       # in order; a slow Sonic (reconnect) doesn't hold up emotion
                 elif topic == bus.DEC_HYP:          # his decoder: a word in his mouth now? (phrases end on pauses)
-                    self.voice.mouthing(msg['utt_id'], bool(msg.get('unlocked')))
+                    # `mouthing`: his lips (or the pads) now; an older decoder only had its unlocked words, which lag
+                    self.voice.mouthing(msg['utt_id'], bool(msg['mouthing'] if 'mouthing' in msg else msg.get('unlocked')))
             except Exception:  # noqa: BLE001  one bad message must not end the call
                 log.exception('bad %s message', topic)
 

@@ -49,6 +49,9 @@ EMG_RAIL = (8, 1015)       # dashboard/state.py: a pad off the skin pins its cha
 EMG_FLAT = 1.0             # raw-unit standard deviation below this: no contact
 MIN_NEW = 5                # frames (0.2 s, the shortest word) a finished segment's late tick must add to go on,
 STILL_THR = 0.12           # ... with the mouth moving in them (lipread/endpoint.py's STILL_THR)
+# a word Claude's hint carried over the camera's own pick locks only if the camera gives it at least this share of its
+# top word's support (a near tie: Claude breaks it); otherwise the camera's word is the one said
+CAM_AGREE = 0.5
 PHRASE_WEIGHT = 0.3        # hint weight of a word that only appears in one of Claude's predicted phrases
 # When a sentence ends (Sentence). The hold starts once the camera ended its segment (0.5 s of still lips) and the end
 # pass ran (end_wait_s): LIPS_STILL_S after the lips stopped. Only the backstop and the fallbacks are fixed times.
@@ -485,10 +488,13 @@ class Fusion:
         new = []
         if settle and self.lock.settle([x['w'] for x in prior] + locked + [x['w'] for x in words],
                                        [x['conf'] for x in prior + u.locked] + [x['p'] for x in words]):
-            new = list(words)   # a wrong guess beats "Please repeat"
+            # a wrong guess beats "Please repeat"; but where only Claude's hint carried a word, the camera's own
+            # reading goes to the voice (Claude predicts, it never decides a word the camera doesn't nearly agree on)
+            new = [dict(x, w=x['cam_top'], cam=x['mc'].get(x['cam_top'], 0.0), claude=0.0,
+                        tokens=self.search.pieces.word_ids(x['cam_top'])) if self._claude_only(x) else x for x in words]
         else:
             for x in words:   # left to right: a word locks only after every word before it
-                if not self.lock.may_lock(x['f'], x['p'], tau):
+                if self._claude_only(x) or not self.lock.may_lock(x['f'], x['p'], tau):
                     break
                 new.append(x)
         for x in new:
@@ -496,10 +502,14 @@ class Fusion:
                                  cam_top=x['cam_top'], emg_top=x['emg_top'], tokens=x['tokens']))
             u.queue.append((now + self.repair_s, len(u.locked) - 1))
         rest = words[len(new):]
+        u.last_words = rest
+        # the camera reads no word in this segment and the pads hear no speech: the search's guesses ('s', 'ok') are
+        # not a word in his mouth, so none is shown (the voice reads an empty unlocked as his pause)
+        if u.cam is not None and u.cam.greedy == '' and (emg_read is None or quiet >= 0.5):
+            rest = []
         u.unlocked = [x['w'] for x in rest]
         u.unlocked_conf = [x['p'] for x in rest]
         u.unlocked_src = [self._source(x) for x in rest]
-        u.last_words = rest
         ms = (time.perf_counter() - t_start) * 1000
         if self.records is not None:
             rec = dict(utt_id=u.utt_id, sentence=sid, seg_id=u.seg_id, seg_start=u.seg_start, t=now, final=final,
@@ -528,7 +538,11 @@ class Fusion:
                                                                   cam_top=x['cam_top'], emg_top=x['emg_top'])
                                                              for x in new]}))
         newest = words[-1] if words else None
-        hyp = {'utt_id': sid, 'locked': [x['w'] for x in prior + u.locked], 'unlocked': u.unlocked,
+        # his mouth is moving on a word now (the camera's activity over the last 0.3 s, or the pads hear speech): the
+        # voice ends a phrase when this goes False. Not "unlocked words": those lag 1-3 s behind his lips
+        lips = u.cam is not None and u.cam.greedy != '' and 1.0 - pause >= STILL_THR
+        mouthing = not final and (lips or (emg_read is not None and quiet < 0.5))
+        hyp = {'utt_id': sid, 'mouthing': mouthing, 'locked': [x['w'] for x in prior + u.locked], 'unlocked': u.unlocked,
                'confidence': [x['conf'] for x in prior + u.locked] + u.unlocked_conf,
                'source': [self._source(x) for x in prior + u.locked] + u.unlocked_src, 'threshold': tau}
         if newest is not None:
@@ -553,6 +567,14 @@ class Fusion:
         return [x for x in out if x != word and x not in near and (pron is None or x in pron)][:4]
 
     # ------------------------------------------------------------------ voice, repairs, repeats
+    @staticmethod
+    def _claude_only(x):
+        """Claude's hint carried this word over the camera's and EMG's own picks, and the camera gives it less than
+        CAM_AGREE of its top word's support: a hint alone never locks a word."""
+        if not x.get('claude') or x['w'] in (x.get('cam_top'), x.get('emg_top')):
+            return False
+        return x['mc'].get(x['w'], 0.0) < CAM_AGREE * x['mc'].get(x['cam_top'], 0.0)
+
     @staticmethod
     def _source(x):
         """Who settled the word: the camera when its own pick, else EMG when EMG's pick, else Claude if predicted."""
@@ -599,7 +621,10 @@ class Fusion:
                 if frm[:1] == [v.locked[j]['w']]:
                     v.locked[j].setdefault('voice', v.locked[j]['w'])
                     v.locked[j]['w'] = words[0]     # the captions only: the voice says what locked, window or not
-        if msg.get('please_repeat') and not any(v.repeat_sent for v in s.utts):
+        # Claude's "please repeat" only while something of the sentence is still unspoken: once the voice has said it
+        # all, asking to repeat a sentence the judge already heard would only confuse the screen
+        unspoken = any(j >= v.spoken for v, j in at) or any(v.unlocked for v in s.utts)
+        if msg.get('please_repeat') and unspoken and not any(v.repeat_sent for v in s.utts):
             out.append(('dec.repeat', {'utt_id': s.sid, 'reason': {
                 'reader': 'Claude', 'words': [dict(index=i, w=v.locked[j]['w'], alts=v.locked[j]['alts'])
                                               for i, (v, j) in enumerate(at) if j >= v.spoken]}}))

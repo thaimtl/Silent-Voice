@@ -134,39 +134,70 @@ def unit():
     check('roles alternate', [m['role'] for m in b.messages] == ['user', 'assistant'] * 2)
 
 
-def early():
-    """While the judge speaks, their partial line starts early predictions (from EARLY_MIN_WORDS words, then every
-    EARLY_STEP_WORDS more, at most every EARLY_EVERY_S); nothing is appended to the conversation; the final line still
-    goes through the conversation lane, and its newer prediction replaces the early one."""
-    b = Brain(FakeClient([reply(words=(('early', 0.9),)), reply(words=(('final', 0.9),))]))
-    b.partner({'text': 'are', 'is_final': False})
-    check('early: not before enough words', b.next_early(0.0) is None)
-    b.partner({'text': 'are you', 'is_final': False})
-    req = b.next_early(0.1)
-    check('early: starts at the minimum words', req is not None and req[1]['lane'] == 'early'
-          and 'are you' in req[0][-1]['content'], req and req[0][-1]['content'])
-    b.partner({'text': 'are you feeling', 'is_final': False})
-    check('early: waits for more words', b.next_early(1.0) is None)
-    b.partner({'text': 'are you feeling nervous', 'is_final': False})
-    check('early: not more often than the interval', b.next_early(0.5) is None)
-    req2 = b.next_early(1.0)
-    check('early: again after more words and time', req2 is not None and 'feeling nervous' in req2[0][-1]['content'])
-    r, log = b.ask(req2[0], lane='early')
-    check('early: the call appends nothing', b.messages == [] and log['lane'] == 'early')
-    out, _ = b.apply(r, req2[1], 3.0)
-    check('early: publishes a prediction', [t for t, _ in out] == ['claude.predict'] and
-          b.predict['words'][0]['w'] == 'early')
-    b.partner({'text': 'are you feeling nervous about the demo', 'is_final': True})
-    check('early: the final line clears the partial and goes to the conversation lane',
-          b.partial == '' and b.next_early(9.0) is None and b.due(9.0, mouthing=False))
+def live_lane():
+    """A prediction is always on its way: a new word in the judge's live line starts a live call (at most every
+    LIVE_JUDGE_EVERY_S, up to MAX_LIVE in flight); otherwise the next starts as soon as the last is back, on the newest
+    context (an unchanged one only after LIVE_IDLE_S). Live calls append nothing; a newer prediction is never
+    overwritten by an older one."""
+    b = Brain(FakeClient([reply(words=(('pancakes', 0.9),)), reply(words=(('burritos', 0.9),))]))
+    check('live: nothing before the call starts', b.next_live(0.0) is None)
+    b.partner({'text': 'what did', 'is_final': False})
+    req = b.next_live(0.1)
+    check('live: the judge\'s first words start a call', req is not None and req[1]['lane'] == 'live'
+          and 'what did' in req[0][-1]['content'], req and req[0][-1]['content'])
+    check('live: not again within the interval', b.next_live(0.2, in_flight=1) is None)
+    b.partner({'text': 'what did you', 'is_final': False})
+    check('live: a new judge word starts another while one is in flight', b.next_live(0.5, in_flight=1) is not None)
+    check('live: at most MAX_LIVE in flight', b.next_live(5.0, in_flight=brain_mod.MAX_LIVE) is None)
+    check('live: an unchanged context waits while nothing is in flight', b.next_live(0.9, in_flight=0) is None)
+    b.unlocked = ['i', 'had']
+    req3 = b.next_live(0.9, in_flight=0)
+    check('live: a changed context starts the next one as soon as the last is back',
+          req3 is not None and 'still being read (may change): i had' in req3[0][-1]['content'])
+    check('live: an unchanged context again after the idle time', b.next_live(0.9 + brain_mod.LIVE_IDLE_S) is not None)
+    r, log = b.ask(req3[0], lane='live')
+    check('live: the call appends nothing', b.messages == [] and log['lane'] == 'live')
+    out, _ = b.apply(r, req3[1], 3.0)
+    check('live: publishes a prediction', [t for t, _ in out] == ['claude.predict'] and b.predict['words'][0]['w'] == 'pancakes')
+    b.partner({'text': 'what did you have for breakfast', 'is_final': True})
+    check('live: the final line clears the live line and goes to the conversation lane',
+          b.partial == '' and b.due(9.0, mouthing=False) and 'just said' in b.live_context())
     target = b.next_request(9.0)
     r2, _ = b.ask()
-    out2, _ = b.apply(r2, target, 11.0)
-    check('early: the final line\'s prediction replaces it', b.predict['words'][0]['w'] == 'final' and
-          'Judge: are you feeling nervous about the demo' in b.messages[0]['content'])
+    b.apply(r2, target, 11.0)
+    check('live: the newer prediction replaces it', b.predict['words'][0]['w'] == 'burritos')
     late, _ = b.apply(reply(words=(('stale', 0.9),)), {'utt_id': None, 'words': [], 'review': [], 'sent': 1.0,
-                                                       'lane': 'early'}, 12.0)
-    check('early: a late early reply never replaces the final one', late == [] and b.predict['words'][0]['w'] == 'final')
+                                                       'lane': 'live'}, 12.0)
+    check('live: a late reply never replaces a newer one', late == [] and b.predict['words'][0]['w'] == 'burritos')
+
+
+def caption():
+    """A closed sentence gets one Opus caption pass on the whole conversation: the corrected sentence (words may change,
+    appear or go) goes out as claude.caption, the conversation hears it next, a failed pass is retried, and the
+    caption lane appends nothing."""
+    fake = FakeClient([{'text': 'i study at mcgill university'}, {'text': 'i study at mcgill university'}])
+    b = Brain(fake)
+    b.locked(lock(5, ('i', []), ('study', []), ('at', []), ('mecca', ['mega']), ('university', [])))
+    check('caption: nothing before the sentence closes', b.next_caption(0.0) is None)
+    b.sentence({'utt_id': 5, 'event': 'hold'})
+    check('caption: a hold is not a close', b.next_caption(0.0) is None)
+    b.sentence({'utt_id': 5, 'event': 'close'})
+    b.sentence({'utt_id': 5, 'event': 'close'})
+    msgs, target = b.next_caption(1.0)
+    check('caption: one pass per closed sentence, on the decoded words', b.captions == [] and target['lane'] == 'caption'
+          and 'i study at mecca university' in msgs[-1]['content'])
+    b.failed(target, 1.5)
+    check('caption: a failed pass is retried', b.captions == [5])
+    b.succeeded()
+    msgs, target = b.next_caption(2.0)
+    r, log = b.ask(msgs, lane='caption')
+    out, _ = b.apply(r, target, 3.0)
+    check('caption: Opus, nothing appended', b.messages == [] and fake.calls[-1]['model'] == brain_mod.REPAIR_MODEL)
+    check('caption: claude.caption with the corrected words', out == [('claude.caption', {
+        'utt_id': 5, 'words': ['i', 'study', 'at', 'mcgill', 'university'],
+        'from': ['i', 'study', 'at', 'mecca', 'university'], 'changed': True, 't': 3.0})], out)
+    check('caption: the conversation hears it next', 'mecca university -> i study at mcgill' in ' '.join(b.notes)
+          and 5 in b.updated and [w['w'] for w in b.utts[5]][3] == 'mcgill')
 
 
 def stale_predict():
@@ -522,7 +553,8 @@ if __name__ == '__main__':
     args = ap.parse_args()
     unit()
     end_lane()
-    early()
+    live_lane()
+    caption()
     stale_predict()
     late_lock()
     empty_reply()

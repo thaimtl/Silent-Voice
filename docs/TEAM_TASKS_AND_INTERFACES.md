@@ -67,8 +67,9 @@ Follow [EVAN_REALTIME_LIP_READING.md](EVAN_REALTIME_LIP_READING.md). You can pro
 3. Live: the reader stamps samples with `bus.now()` (`time.perf_counter()`) and publishes `emg.raw` every 10 ms.
 4. Safety: the laptop runs on battery whenever the pads are on skin; never charge with the Uno connected.
 5. The Claude service:
-    - **Predict:** while the judge is still speaking, from the partial `partner.text` (once 2 words are in, then every 2 more, at most every 0.7 s, up to two calls in flight), again on the final line, and every ~2 s while Austin mouths, publish `claude.predict`: likely words and phrases, plus how predictable the next words are. The newest prediction always replaces older ones.
+    - **Predict:** a prediction is always on its way (the live lane): a call on every new word of the judge's partial `partner.text` (at most every 0.3 s, up to three in flight), and otherwise the next call as soon as the last is back, on the newest context (the judge's line so far, their final lines, Austin's sentence so far, the last repairs), again on the final line, and every ~2 s while Austin mouths, publish `claude.predict`: likely words and phrases, plus how predictable the next words are. The newest prediction always replaces older ones.
     - **Repair:** on each `dec.lock`, publish `claude.repair`.
+    - **Caption pass:** on each `dec.sentence` close, Opus rewrites the whole sentence for the caption and publishes `claude.caption` (captions only, never the voice).
     - **How it calls Claude:** predictions on `claude-haiku-5-5` with thinking off and low effort (about 2 to 3 s a call), repairs on `claude-opus-5-5` (accuracy; they fix the captions only, never the voice), structured outputs, prompt caching (rules and conversation kept as an append-only prefix).
     - **Prompt rules:** swap a word only for one of the alternatives given or a lip look-alike, never add ideas, answer "please repeat" when unsure.
 
@@ -102,14 +103,15 @@ flowchart TD
 | `cam.final` | Evan → Austin | at segment end | `seg_id`, `nbest` [{`text`, `score`}] |
 | `cam.face` | Evan → dashboard | ~12.5 Hz | `t`, `w`, `h`, `face_ok`, `pts` (478 × 2, normalised), `blend` (52), `pose` (yaw, pitch, roll) |
 | `cam.preview` | Evan → dashboard | every processed frame, at most 30 Hz | `t`, `w`, `h`, `jpeg` (the processed frame, 640 px wide): the dashboard's mirror of the webcam, which only the lip reader can open; `pts` (that frame's 478 × 3 face points: x / w, y / h and MediaPipe's z; nil without a face), so the pads drawn on it sit on his face. Sent from its own thread without blocking (`lipread/preview.py`), so it never slows the lip reader |
-| `dec.hyp` | Austin → dashboard | every 100 ms | `utt_id`, `locked` [words], `unlocked` [words], `confidence` per word, `source` per word (camera / EMG / Claude); optional for the dashboard: `cands` [{`w`, `cam`, `emg`, `claude`}] (top 3 for the newest word) and `threshold` |
+| `dec.hyp` | Austin → dashboard, call | every 100 ms | `utt_id`, `mouthing` (his lips, or the pads, are on a word now: the voice ends a phrase when it goes false), `locked` [words], `unlocked` [words], `confidence` per word, `source` per word (camera / EMG / Claude); optional for the dashboard: `cands` [{`w`, `cam`, `emg`, `claude`}] (top 3 for the newest word) and `threshold` |
 | `dec.lock` | Austin → Claude, dashboard | on lock | `utt_id`, `words` [{`w`, `conf`, `alts`, `cam`, `emg`, `t`}]; optional for the dashboard: per word `cam_top`, `emg_top` (each reader's own pick, for the end screen's disagreement bars) |
 | `dec.repeat` | Austin → dashboard | at sentence end | `utt_id`, `reason` (which reader disagreed, confidences); the dashboard reads `reason` as {`reader` (camera / EMG / Claude), `words` [{`index`, `w`, `alts`}]} |
 | `claude.predict` | Claude → Austin | while the judge speaks, on their final line, ~2 s while Austin mouths | `words` [{`w`, `weight`}], `phrases`, `predictability` (0 to 1), `ttl_s` |
+| `claude.caption` | Claude → dashboard | after a sentence closes | `utt_id`, `words` (the corrected sentence), `from` (as decoded), `changed` |
 | `claude.repair` | Claude → Austin, dashboard | on reply | `utt_id`, `edits` [{`index`, `from`, `to`}], `please_repeat` |
 | `dec.pause` | Austin → Claude | when Austin's lips stop, and again while the answer is no | `utt_id`, `words` (the sentence so far), `n_words`, `silence_s`, `ask` |
 | `claude.end` | Claude → Austin | on reply | `utt_id`, `p_complete` (0 to 1: has he finished?), `ask` |
-| `dec.sentence` | Austin → logger | on each hold, continuation and close | `utt_id`, `event` (`hold` / `continue` / `close`), `reason` (judge spoke, Claude: finished, Claude did not answer, backstop, no Claude, please repeat), `held_s`, `p`, `asks`, `segments`, `words` |
+| `dec.sentence` | Austin → logger, Claude | on each hold, continuation and close | `utt_id`, `event` (`hold` / `continue` / `close`), `reason` (judge spoke, Claude: finished, Claude did not answer, backstop, no Claude, please repeat), `held_s`, `p`, `asks`, `segments`, `words` |
 | `voice.say` | Austin → Frank | words leaving the repair window | `utt_id`, `words` (only the new ones), `offset` (index of `words[0]` in the sentence, optional), `final`, `pace`, `effort` (both relative, 1.0 = Austin's normal; below) |
 | `partner.text` | Frank → Claude, dashboard | streaming | `text`, `is_final`, `t`, `source` (`ink`, or `sms` when the judge texts: one final line per text) |
 | `call.state` | Frank → dashboard | on change | `state` (`connected` / `ended` / `channel`), `t`, plus `call_sid`, `ink` and `channel` (`call` or `sms`) on connect; `state: channel` when the mode is switched (dashboard Call / Text switch), with `channel` and `ink` |

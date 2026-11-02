@@ -1,0 +1,37 @@
+# Live benchmark: Austin mouths these in this order, one per sentence, with a clear pause (about 2 s) after each,
+# so every run is scored against the same truth. Same conditions each time: light, camera position, EMG on or off.
+# Groups: A demo lines, B near the demo lines (must not be confused with them), C free speech,
+# D lip look-alikes (b/m/p, f/v, t/d/n), E short replies, F names and numbers.
+# A
+hi i'm austin and right now i'm not making a sound
+we built a voice out of silence
+it reads the electrical signals of my muscles and looks at my lips
+it works in the dark where no camera is able to see
+the harder i push my words the louder my voice gets
+we are a team of two
+# B
+we built a house out of wood last summer
+it reads the menu out loud for me
+the harder i run the faster i get tired
+i'm a student at the university of toronto
+# C
+i had a burrito for lunch today
+my flight home is on monday morning
+we stayed up until four in the morning
+the wifi here keeps dropping
+can you hear me okay
+what time do the judges finish
+# D
+my mom made a big batch of muffins
+bring me a bottle of water please
+i found five videos on my phone
+ten of them died in the night
+# E
+yes
+no thanks
+sounds good
+thank you so much
+# F
+frank and i met at mcgill
+it cost about forty five dollars
+anthropic and cartesia power the voice

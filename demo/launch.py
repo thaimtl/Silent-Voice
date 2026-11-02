@@ -11,7 +11,9 @@
 
 Order (each waits until the part before it is really working, not just started):
     pre-flight -> logger -> EMG publisher -> camera reader -> Claude -> tunnel -> call server -> Twilio webhook
-    -> decoder (EMG calibration: Austin mouths 60 s) -> dashboard
+    -> decoder -> dashboard
+The camera reader warms up (~40 s) while Claude, the tunnel, the call server and Twilio start; the decoder waits for
+it. The decoder reuses the last EMG calibration; after re-padding, --calibrate 60 has Austin mouth for 60 s.
 Ctrl-C stops everything in reverse order (the logger last, so it records it all). A part that crashes is restarted
 (up to MAX_RESTARTS times; a call that was on is lost with its server). Each run gets a folder under $RECLAIM_WORKDIR/logs/
 with every part's output and the bus log.
@@ -144,9 +146,12 @@ def wait_bus(addr, topic, timeout_s, alive=lambda: True):
         sock.close()
 
 
+UA = {'User-Agent': 'SilentVoice-launcher'}   # Cloudflare's bot check on our domain answers Python-urllib with 403
+
+
 def http_status(url, timeout=3.0):
     try:
-        with urllib.request.urlopen(url, timeout=timeout) as r:
+        with urllib.request.urlopen(urllib.request.Request(url, headers=UA), timeout=timeout) as r:
             return r.status
     except urllib.error.HTTPError as e:
         return e.code
@@ -168,7 +173,8 @@ def public_status(url, path='/twiml', timeout=8.0):
             ip = next(a['data'] for a in json.load(r).get('Answer', []) if a.get('type') == 1)
         raw = socket.create_connection((ip, 443), timeout=timeout)
         with ssl.create_default_context().wrap_socket(raw, server_hostname=host) as s:
-            s.sendall(f'GET {path} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n'.encode())
+            s.sendall(f'GET {path} HTTP/1.1\r\nHost: {host}\r\nUser-Agent: {UA["User-Agent"]}\r\n'
+                      f'Connection: close\r\n\r\n'.encode())
             return int(s.recv(64).split(b' ', 2)[1])
     except (OSError, StopIteration, ValueError, IndexError, KeyError):
         return None
@@ -361,6 +367,9 @@ class Launcher:
                   'copy it from Frank, or run without --rehearse')
         else:
             check(self.camera_opens(), f'webcam {a.cam}', 'plug in the C920, close other apps using it, or pass --cam 1')
+            if not self.face_adapter().exists():    # not a blocker: the base model still reads, at twice the errors
+                say(f'no face adapter at {self.face_adapter()}: the camera reads with the base model (2x the word '
+                    'errors); copy it from the bucket', None)
         if not (a.no_emg or a.rehearse):
             self.uno = a.port or self.find_uno()
             check(bool(self.uno), f'Uno on {self.uno or "?"}', 'plug in its USB cable, pass --port COMx, or --no-emg')
@@ -369,6 +378,9 @@ class Launcher:
                 say('the laptop is charging: unplug the charger before the pads go on skin (no USB isolator)', False)
                 problems.append('charger')
         return not problems
+
+    def face_adapter(self):
+        return self.work / 'data' / 'face_adapter' / 'austin.pth'
 
     def cloudflared(self):
         for p in (shutil.which('cloudflared'), self.work / ('cloudflared.exe' if WINDOWS else 'cloudflared'),
@@ -408,6 +420,10 @@ class Launcher:
                               ('bus', ep['emg'], 'emg.raw'), 30))
         if not a.rehearse:
             cam = self.module('venv-live', 'lipread.run', '--cam', str(a.cam), '--quiet')
+            if self.face_adapter().exists():    # Austin's face: halves the camera's word errors (lipread/MEASURED.md)
+                cam += ['--face-adapter', str(self.face_adapter())]
+            if getattr(a, 'exposure', None) is not None:   # a stop under auto (~-6) reads lips better (Oct 25)
+                cam += ['--exposure', str(a.exposure)]
             parts.append(Part('Camera', cam + (['--camera-settings'] if a.camera_settings else []),
                               ('bus', ep['cam'], 'cam.preview'), 300 if a.camera_settings else 120))
         if not a.no_claude:
@@ -428,9 +444,15 @@ class Launcher:
         say(f'this run\'s logs: {self.folder}')
         try:
             *before, decoder = self.plan()
+            camera = next((p for p in before if p.name == 'Camera'), None)
             for part in before:
-                self.start(part)
+                if part is camera:
+                    self.launch(part)           # it warms up while the rest starts
+                else:
+                    self.start(part)
             self.start_call()                   # the network can fail: before the calibration, not after it
+            if camera:
+                self.ready(camera)
             self.start(decoder)
             self.start(Part('Dashboard', self.module('venv-call', 'dashboard.server', '--port', str(self.dash_port),
                                                      '--number', pretty_number(self.keys.get('TWILIO_NUMBER')),
@@ -447,9 +469,15 @@ class Launcher:
             self.shutdown()
 
     def start(self, part):
+        self.launch(part)
+        self.ready(part)
+
+    def launch(self, part):
         say(f'starting {part.name}')
         part.start(self.folder, self.env)
         self.parts.append(part)
+
+    def ready(self, part):
         if not part.wait_ready(self.prompt_for(part)):
             raise StartFailed(f'{part.name} did not come up ({"crashed" if not part.alive() else "timed out"}); '
                               f'its last lines:\n{part.tail()}\n        full log: {part.log}')
@@ -468,12 +496,22 @@ class Launcher:
         return on_line
 
     def start_call(self):
-        """Tunnel first (the call server must know its public address), then the server, then Twilio."""
-        tunnel = Part('Tunnel', [self.cloudflared(), 'tunnel', '--no-autoupdate', '--url',
-                                 f'http://127.0.0.1:{self.call_port}'], ('line', TUNNEL_URL.pattern), 60,
-                      restart=False)
-        self.start(tunnel)
-        self.public_url = TUNNEL_URL.search(tunnel.output()).group(0)
+        """Tunnel first (the call server must know its public address), then the server, then Twilio.
+        --tunnel-host (RECLAIM_TUNNEL_HOST): our named Cloudflare tunnel, the same address every launch and no
+        quick-tunnel rate limit (429 after many restarts); without it, a new quick tunnel each launch."""
+        url = f'http://127.0.0.1:{self.call_port}'
+        named = getattr(self.args, 'tunnel_host', None)
+        if named:
+            tunnel = Part('Tunnel', [self.cloudflared(), 'tunnel', '--no-autoupdate', 'run', '--url', url,
+                                     getattr(self.args, 'tunnel_name', 'silentvoice')],
+                          ('line', r'Registered tunnel connection'), 60, restart=False)
+            self.start(tunnel)
+            self.public_url = f'https://{named}'
+        else:
+            tunnel = Part('Tunnel', [self.cloudflared(), 'tunnel', '--no-autoupdate', '--url', url],
+                          ('line', TUNNEL_URL.pattern), 60, restart=False)
+            self.start(tunnel)
+            self.public_url = TUNNEL_URL.search(tunnel.output()).group(0)
         host = urllib.parse.urlparse(self.public_url).hostname
         self.start(Part('Call', self.module('venv-call', 'call.server'), ('line', r'Sonic websocket open'), 60,
                         env={'PUBLIC_HOST': host, 'PORT': str(self.call_port), 'CALL_CHANNEL': self.args.mode,
@@ -656,14 +694,22 @@ def main(argv=None):
     ap.add_argument('--rehearse', action='store_true', help='no camera or pads: session 3 plays when a call connects')
     ap.add_argument('--cam', type=int, default=0, help='webcam index (default 0)')
     ap.add_argument('--camera-settings', action='store_true', help='Windows: lock exposure and focus in a dialog')
+    ap.add_argument('--exposure', type=lambda s: None if s == 'auto' else float(s), default=-7.0 if WINDOWS else None,
+                    help="webcam exposure in DirectShow units, a stop darker than auto by default on Windows (-7; "
+                         "'auto' for the camera's own, the default elsewhere)")
     ap.add_argument('--port', default=None, help="the Uno's serial port, e.g. COM5 (default: found by itself)")
-    ap.add_argument('--calibrate', type=float, default=60.0, help='seconds of EMG calibration at the start (0: none)')
+    ap.add_argument('--calibrate', type=float, default=0.0,
+                    help='seconds of EMG calibration at the start, after re-padding (default 0: reuse the last one)')
     ap.add_argument('--repair-s', type=float, default=0.0,
                     help='wait before a locked word is spoken (default 0: repairs fix the captions only, never the voice)')
     ap.add_argument('--call-port', type=int, default=CALL_PORT)
     ap.add_argument('--dash-port', type=int, default=DASH_PORT)
     ap.add_argument('--number', default=None, help='use this Twilio number instead of TWILIO_NUMBER, e.g. +16282293851')
     ap.add_argument('--no-webhook', action='store_true', help="don't touch the Twilio number's webhook")
+    ap.add_argument('--tunnel-host', default=os.environ.get('RECLAIM_TUNNEL_HOST'),
+                    help='public host of our named Cloudflare tunnel (default $RECLAIM_TUNNEL_HOST; none: a quick tunnel)')
+    ap.add_argument('--tunnel-name', default=os.environ.get('RECLAIM_TUNNEL_NAME', 'silentvoice'),
+                    help='name of the named tunnel (cloudflared tunnel create NAME)')
     ap.add_argument('--no-browser', action='store_true', help="don't open the dashboard in the browser")
     ap.add_argument('--yes', action='store_true', help="don't ask about the signal check")
     args = ap.parse_args(argv)

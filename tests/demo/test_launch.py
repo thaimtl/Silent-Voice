@@ -162,12 +162,15 @@ def test_the_call_line_is_up_before_the_calibration(tmp_path, monkeypatch):
     lc = launcher(tmp_path)
     order = []
     monkeypatch.setattr(lc, 'start', lambda part: order.append(part.name))
+    monkeypatch.setattr(lc, 'launch', lambda part: order.append(f'{part.name} starts'))
+    monkeypatch.setattr(lc, 'ready', lambda part: order.append(f'{part.name} ready'))
     monkeypatch.setattr(lc, 'start_call', lambda: order.append('Call'))
     monkeypatch.setattr(lc, 'ready_banner', lambda: None)
     monkeypatch.setattr(lc, 'watch', lambda: None)
     with redirect_stdout(io.StringIO()):
         lc.run()
-    assert order == ['Logger', 'EMG', 'Camera', 'Claude', 'Call', 'Decoder', 'Dashboard']
+    # the camera warms up while Claude and the call side start; the decoder waits for it
+    assert order == ['Logger', 'EMG', 'Camera starts', 'Claude', 'Call', 'Camera ready', 'Decoder', 'Dashboard']
 
 
 @pytest.mark.parametrize('mode', ['call', 'sms'])
@@ -181,6 +184,8 @@ def test_the_mode_reaches_the_call_server_the_dashboard_and_twilio(tmp_path, mon
         if part.name == 'Tunnel':
             part.output = lambda: '|  https://a-b.trycloudflare.com  |'
     monkeypatch.setattr(lc, 'start', start)
+    monkeypatch.setattr(lc, 'launch', start)
+    monkeypatch.setattr(lc, 'ready', lambda part: None)
     monkeypatch.setattr(lc, 'cloudflared', lambda: 'cloudflared')
     monkeypatch.setattr(launch, 'public_status', lambda url: 405)
     monkeypatch.setattr(launch.Twilio, 'point_at',

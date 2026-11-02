@@ -9,7 +9,7 @@ One launcher starts everything in order on Austin's laptop and checks each part 
 3. Double-click **`Launch Silent Voice.bat`** in the repo folder.
    - It asks whether the signal check is done; press Enter.
    - It runs the pre-flight checks, then starts each part. Every line says `[ ok ]` or `[FAIL]` with the fix.
-   - When the decoder starts, it shows a banner: **Austin mouths a few normal sentences for 60 s** (EMG calibration).
+   - The decoder reuses the last EMG calibration. After the pads are re-placed, start with `--calibrate 60`: when the decoder starts, it shows a banner, **Austin mouths a few normal sentences for 60 s**, and that calibration is saved for the next starts.
 4. When it shows **SILENT VOICE IS READY**, the dashboard is open in the browser and the judge can call the number on screen.
 5. At the end, press **Ctrl-C** in the launcher window. Everything stops in order, and the logs are kept in the folder it printed.
 
@@ -63,7 +63,7 @@ Done once per laptop.
 
 ## What it starts
 
-In this order, each one only once the one before is ready:
+In this order, each one only once the one before is ready, except the camera: it warms up (~40 s) while Claude, the tunnel and the call server start, and the decoder waits for it:
 
 | Part | Command | Ready when |
 | --- | --- | --- |
@@ -73,7 +73,7 @@ In this order, each one only once the one before is ready:
 | Claude | `claude_service.service` | it has its key |
 | Tunnel | `cloudflared` to the call server's port | it has a public address |
 | Call | `call.server`, told the tunnel's address | Sonic is connected; then the address is checked from outside and the Twilio number pointed at it |
-| Decoder | `fusion.run` (`--calibrate 60` with pads) | it runs (after the calibration) |
+| Decoder | `fusion.run` (the last calibration; `--calibrate 60` refits it) | it runs (after the calibration, if any) |
 | Dashboard | `dashboard.server` | its page loads |
 
 Call-audio recording is always off. No key is ever printed or logged by the launcher.

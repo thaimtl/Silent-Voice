@@ -360,8 +360,8 @@ function explainParts(s, a) {
     const best = k => [...rows].sort((x, y) => y[k] - x[k])[0];
     const byCam = best('cam'), byEmg = best('emg'), top = rows[0];
     if (!a.repeat && !repair) {
-      text += `<div class="note">${!s.muscles ? 'The muscle sensors are off, so the camera and Claude decide alone.'
-        : byCam.w !== top.w ? `Lips alone see “${esc(byCam.w)}”. With the conversation, “${esc(top.w)}” leads.`
+      text += `<div class="note">${byCam.w !== top.w ? `Lips alone see “${esc(byCam.w)}”. With the conversation, “${esc(top.w)}” leads.`
+        : !s.muscles ? `The lips read “${esc(top.w)}”.`
         : byEmg.w !== top.w ? `Muscles alone lean to “${esc(byEmg.w)}”. Lips and the conversation pick “${esc(top.w)}”.`
         : `Lips and muscles agree on “${esc(top.w)}”.`}</div>`;
     }
@@ -542,12 +542,13 @@ function renderCamera(s) {
   $('cam-empty').textContent = s.status.text.startsWith('Camera') ? 'Camera: no signal' : 'Waiting for the camera';
 
   const chip = $('chip');
-  const label = !s.face_ok ? 'Face hidden' : !s.muscles ? 'Muscle sensors off' : s.emotion.chip;
+  const label = !s.face_ok ? 'Face hidden' : s.emotion.chip;    // muscle sensors off: no indicator at all
   chip.querySelector('span').textContent = label;
-  chip.querySelector('i').style.background = !s.face_ok || !s.muscles ? '#8b95a1' : css(TONE_COLOR[s.emotion.label] || '--calm');
+  chip.querySelector('i').style.background = !s.face_ok ? '#8b95a1' : css(TONE_COLOR[s.emotion.label] || '--calm');
   $('lips-off').classList.toggle('hidden', s.face_ok);
 
   const box = $('pads');             // content per snapshot, position per video frame
+  box.classList.toggle('hidden', !s.muscles);    // sensors off: no pads drawn, rather than greyed-out ones
   if (box.children.length !== s.pads.length) {
     box.innerHTML = s.pads.map(() => `<div class="pad"><svg width="${W}" height="${H}"><line/></svg>` +
       '<span class="pdot"></span><span class="pill"><span class="pn"></span>' +
@@ -720,6 +721,7 @@ function renderThread(turns) {
       if (r.index < ws.length && bare(ws[r.index]) === bare(r.to)) ws[r.index] = `<s>${esc(r.frm)}</s> ${ws[r.index]}`;
     const notes = [
       (x.repairs || []).length ? `<div class="cnote claude">${use('claude-mark')}Claude fixed a look-alike</div>` : '',
+      x.caption_fixed ? `<div class="cnote claude">${use('claude-mark')}Claude corrected the caption (read as “${esc(x.original || '')}”)</div>` : '',
       x.repeat ? `<div class="cnote repeat">${use('repeat-icon')}Asked to repeat, nothing wrong was said</div>` : '',
       x.face_hidden ? `<div class="cnote face">${liveIcon('read')}Face hidden, muscles carried it</div>` : ''].join('');
     return `<div class="msg austin${x.repeat ? ' unspoken' : ''}"><div class="bubble">${ws.join(' ')}${x.repeat ? ' …' : ''}</div>${notes}</div>`;

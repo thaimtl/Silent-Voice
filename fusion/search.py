@@ -110,6 +110,8 @@ class CamReading:
         self.frame_t = np.asarray(msg['frame_t'], np.float64)
         self.activity = np.asarray(msg.get('activity', np.zeros(len(self.frame_t))), np.float64)
         self.face_ok = bool(msg.get('face_ok', True))
+        g = msg.get('greedy')                                   # the camera's own reading ('': no word seen; None:
+        self.greedy = None if g is None else str(g).strip()     # not sent)
         self.seg_id, self.seg_start = int(msg['seg_id']), float(msg['seg_start'])
         T = len(self.ids)
         p = np.exp(self.logp)

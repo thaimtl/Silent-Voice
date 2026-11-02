@@ -5,15 +5,21 @@ Two lanes, one conversation (docs/REALTIME_PIPELINE.md, "Claude"):
   message (judge lines, Austin's locked words, the repairs made since) and Claude's reply to it, so prompt caching
   reuses everything before. It runs on every final judge line and about every PREDICT_EVERY_S while something
   changed.
-- The early lane: while the judge is still speaking, Cartesia Ink's partial transcript starts a prediction call as soon
-  as EARLY_MIN_WORDS words are in, then again every EARLY_STEP_WORDS more (at most every EARLY_EVERY_S, up to
-  MAX_EARLY in flight, so a fresher one is always on its way).
-  Like a repair call it reads the conversation and appends nothing; the final line still goes through the
-  conversation lane, and that newer prediction replaces the early ones. The early call adds no delay to anything.
+- The live lane: a prediction is always on its way. Whenever the judge's live transcript (Cartesia Ink's partial
+  line) gains a word, a call starts (at most every LIVE_JUDGE_EVERY_S, up to MAX_LIVE in flight); otherwise, as soon
+  as the last live call is back, the next one starts with the newest context: the judge's line so far, their final
+  lines not yet in the conversation, Austin's current sentence (locked and still being read) and the last repairs.
+  A context that hasn't changed is asked again only after LIVE_IDLE_S. Like a repair call it reads the
+  conversation and appends nothing, so the conversation lane stays append-only and cached. No call adds delay.
 - The repair lane: each dec.lock starts its own call at once (up to MAX_REPAIRS in flight), so a repair never waits
   behind another call. A repair call is the conversation so far plus one review message, and its reply is never
   appended: the conversation stays append-only (no thinking block is ever replayed after an edited prefix), and
   every repair call reads the same cached prefix. What it decided reaches the conversation in the next
+  conversation-lane message.
+- The caption lane: when a sentence closes (dec.sentence close), Opus reads the whole conversation and the sentence as
+  decoded, and writes the sentence Austin most likely said, free to change, add or drop words (names, numbers,
+  dropped short words, look-alikes), as claude.caption. It changes the captions only, never the voice, so it takes
+  its time. Like a repair call it appends nothing; the corrected sentence reaches the conversation in the next
   conversation-lane message.
 - The end lane: when Austin's lips stop, the decoder holds his sentence and asks (dec.pause) whether he has finished;
   each check is one Haiku call on the conversation so far plus his sentence and how long he has been still, with a
@@ -44,7 +50,7 @@ requeues its words for review, each until MAX_FAILURES in a row; a refused repai
 import json
 import time
 
-MODEL = "claude-haiku-5-5"           # predictions (conversation and early lanes): speed
+MODEL = "claude-haiku-5-5"           # predictions (conversation and live lanes): speed
 REPAIR_MODEL = "claude-opus-5-5"     # repairs: accuracy (they only fix the captions, so its ~5 s costs nothing)
 FALLBACK_BETA = "server-side-fallback-2026-07-01"
 REPAIR_MAX_TOKENS = 16000            # Opus always thinks first: room for the thinking and the reply
@@ -53,14 +59,15 @@ PREDICT_EVERY_S = 2.0  # while Austin is mouthing
 PREDICT_TTL_S = 4.0
 MAX_UTTS = 8           # utterances kept for late locks and reviews
 MAX_REPAIRS = 3        # repair calls in flight at once, besides the conversation call
-MAX_EARLY = 2          # early prediction calls in flight at once
-EARLY_MIN_WORDS = 2    # the judge's partial line starts an early prediction once it has this many words
-EARLY_STEP_WORDS = 2   # ... and another every this many more words
-EARLY_EVERY_S = 0.7    # ... but at most this often
+MAX_LIVE = 3           # live prediction calls in flight at once
+LIVE_JUDGE_EVERY_S = 0.3  # a new word in the judge's live line starts a live call at most this often
+LIVE_EVERY_S = 0.3     # otherwise the next live call starts this soon after the last one is back
+LIVE_IDLE_S = 3.0      # ... and an unchanged context is asked again only after this long
 BACKOFF_S = (1.0, 2.0, 4.0, 8.0)  # wait after 1, 2, 3, 4+ failed calls in a row, from the moment it failed
 MAX_FAILURES = 3       # failed calls in a row after which the failing request's content is dropped
 MAX_PENDING_LINES = 20  # newest judge lines kept while calls fail
 MAX_END = 2            # end checks in flight at once (a newer one replaces a check not yet sent)
+MAX_CAPTION = 2        # caption passes in flight at once
 END_MAX_TOKENS = 300   # the end check's reply is one number
 
 SYSTEM = """You are the conversation model inside Silent Voice, a silent-speech system for people who lost their voice box. \
@@ -73,9 +80,17 @@ t/d/n, k/g, and sounds hidden behind the teeth. The muscle reader helps, but bot
 You know the conversation, so you can tell which look-alike Austin meant.
 
 Each message tells you what happened since the last one: lines the judge finished saying, and Austin's current \
-utterance as locked so far, one word per line with its index, and the repairs you already made. Some messages \
+utterance as locked so far, one word per line with its index, and the repairs you already made. A word marked \
+"(unsure, or: a/b)" was a low-confidence reading and may really be one of those look-alikes, or something else: \
+don't build your predictions on it as if it were certain. Some messages \
 list words under "review" with the decoder's confidence (conf), the camera and EMG support (cam, emg, 0 to 1) and \
 the alternatives it considered (alts), including the word's lip look-alikes.
+
+Background: this is Cal Hacks, a student hackathon in San Francisco, and the judge is a hackathon judge evaluating \
+the project, not a court judge. Austin is a student at McGill University; his team (with Frank) built Silent Voice, \
+silent speech for patients who lost their voice box (laryngectomy) or their voice to ALS. Words that often come up: \
+Austin, Frank, Cal Hacks, McGill University, Red Bull, coffee, Meta, Anthropic, Cartesia, ASL, ALS, patients, \
+laryngectomy, voice box. The judge may also make small talk (food, sleep, school, plans).
 
 You have two jobs, and every reply does both.
 
@@ -132,6 +147,23 @@ END_SCHEMA = {
     "additionalProperties": False,
 }
 
+CAPTION_SCHEMA = {
+    "type": "object",
+    "properties": {"text": {"type": "string"}},
+    "required": ["text"],
+    "additionalProperties": False,
+}
+
+CAPTION_CHECK = """Caption pass (this message only asks this, with its own rules; no predictions or repairs). Austin's \
+sentence {utt} has ended. The decoder read it from his lips and face muscles as:
+{words}
+Lip reading confuses words that look alike on the lips (b/m/p, f/v, t/d/n, k/g, sounds behind the teeth), drops \
+short words, splits or merges words, and mangles names and numbers. Using the whole conversation, write the sentence \
+Austin most likely mouthed, for the on-screen caption: change, add or remove any words you need to, and fix names, \
+numbers and grammar. Keep what he meant: never add an idea he didn't express. If the reading is too broken to tell, \
+stay close to the decoded words. Reply with text: the corrected sentence, lowercase, no punctuation except \
+apostrophes."""
+
 END_CHECK = """End-of-sentence check (this message only asks this; no predictions or repairs). Austin stopped \
 mouthing {silence:.1f} s ago. His current sentence so far, as the decoder read it (it may hold look-alike mistakes):
 {words}
@@ -167,6 +199,17 @@ def _word(w):
     alts = w.get("alts")
     return {"w": w["w"], "alts": [a for a in alts if isinstance(a, str)] if isinstance(alts, list) else [],
             "conf": _num(w.get("conf")), "cam": _num(w.get("cam")), "emg": _num(w.get("emg")), "t": _num(w.get("t"))}, True
+
+
+UNSURE = 0.6   # a locked word below this confidence is shown with its look-alikes: it may be a misreading
+
+
+def _shown(w):
+    """A locked word as the prediction lanes see it: an unsure one with its look-alikes, so Claude never builds the
+    next prediction on a misreading (or on its own earlier prediction, if that is what the decoder picked)."""
+    if w["w"] != "?" and w.get("conf") is not None and w["conf"] < UNSURE and w.get("alts"):
+        return f"{w['w']} (unsure, or: {'/'.join(w['alts'][:3])})"
+    return w["w"]
 
 
 def _cached(messages):
@@ -205,31 +248,59 @@ class Brain:
         self.failures = 0     # failed calls in a row, either lane (see failed)
         self.retry_at = -1e9  # no new call before this, after a failure (bus.now() seconds)
         self.partial = ""     # the judge's line so far, while they speak (Ink's partial transcript)
-        self.early_words = 0  # words in the partial line the last early prediction was asked on
-        self.early_at = -1e9
+        self.live_words = 0   # words in the judge's live line the last live call was asked on
+        self.live_at = -1e9   # when the last live call started
+        self.live_asked = ""  # the context it was asked on
         self.end = None       # the newest dec.pause not yet asked (end lane)
+        self.captions = []    # closed sentences waiting for their caption pass (caption lane), oldest first
 
     def partner(self, msg):
         text = msg.get("text", "").strip()
         if msg.get("is_final"):
             if text:
                 self.events.append(text)
-            self.partial, self.early_words = "", 0   # the line is done: the conversation lane takes it from here
+            self.partial, self.live_words = "", 0   # the line is done: it is in the next live context and conversation call
         elif text:
             self.partial = text
 
-    def next_early(self, now):
-        """An early-lane call while the judge is still speaking: (messages, target), or None when it isn't time. The
-        messages are the conversation so far plus the partial line; nothing is appended to the conversation."""
-        n = len(self.partial.split())
-        if now < self.retry_at or n < EARLY_MIN_WORDS or n < self.early_words + EARLY_STEP_WORDS \
-                or now - self.early_at < EARLY_EVERY_S:
+    def live_context(self):
+        """What a live call is asked on: the newest context, not yet in the conversation."""
+        parts = []
+        if self.events:
+            parts.append("The judge just said (not in the conversation yet):\n" + "\n".join(self.events))
+        if self.partial:
+            parts.append(f"The judge is speaking now. Their line so far (a live transcript, it may change): {self.partial}")
+        if self.utts:
+            utt = next(reversed(self.utts))
+            locked = " ".join(_shown(w) for w in self.utts[utt])
+            parts.append(f"Austin's current sentence, locked so far: {locked or '(nothing yet)'}")
+        if self.unlocked:
+            parts.append("Austin is mouthing, still being read (may change): " + " ".join(self.unlocked))
+        if self.notes:
+            parts.append("Your last repairs:\n" + "\n".join(self.notes[-3:]))
+        return "\n\n".join(parts)
+
+    def next_live(self, now, in_flight=0):
+        """A live-lane call: (messages, target), or None when it isn't time. A new word in the judge's live line starts
+        one at once (at most every LIVE_JUDGE_EVERY_S, up to MAX_LIVE in flight); otherwise one starts as soon as the
+        last is back, on the newest context (an unchanged one only after LIVE_IDLE_S). The messages are the
+        conversation so far plus that context; nothing is appended to the conversation."""
+        if now < self.retry_at or in_flight >= MAX_LIVE:
             return None
-        self.early_words, self.early_at = n, now
-        content = (f"The judge is still speaking. Their line so far (a live transcript, it may change): {self.partial}\n\n"
-                   "Nothing is under review. Predict what Austin is likely to answer.")
+        context = self.live_context()
+        if not context and not self.messages:
+            return None     # the call hasn't started: nothing to predict from
+        n = len(self.partial.split())
+        judge_new = n > self.live_words and now - self.live_at >= LIVE_JUDGE_EVERY_S
+        settled = in_flight == 0 and now - self.live_at >= LIVE_EVERY_S and \
+            (context != self.live_asked or now - self.live_at >= LIVE_IDLE_S)
+        if not (judge_new or settled):
+            return None
+        self.live_words, self.live_at, self.live_asked = n, now, context
+        content = ((context + "\n\n") if context else "") + \
+            "Nothing is under review. Predict what Austin is likely to mouth next."
         return list(self.messages) + [{"role": "user", "content": content}], \
-            {"utt_id": None, "words": [], "review": [], "sent": now, "lane": "early"}
+            {"utt_id": None, "words": [], "review": [], "sent": now, "lane": "live"}
 
     def pause(self, msg):
         """dec.pause: Austin's lips stopped and the decoder holds his sentence. The newest replaces one not yet sent."""
@@ -250,6 +321,26 @@ class Brain:
                                    judge=judge)
         return _cached(self.messages) + [{"role": "user", "content": content}], \
             {"utt_id": e["utt_id"], "words": [], "review": [], "sent": now, "lane": "end", "ask": e["ask"]}
+
+    def sentence(self, msg):
+        """dec.sentence: a closed sentence with locked words gets a caption pass."""
+        utt = msg.get("utt_id")
+        if msg.get("event") == "close" and utt in self.utts and any(w["w"] != "?" for w in self.utts[utt]) \
+                and utt not in self.captions:
+            self.captions.append(utt)
+
+    def next_caption(self, now):
+        """A caption-lane call for the oldest closed sentence waiting: (messages, target), or None. The messages are the
+        conversation so far plus the check; nothing is appended to the conversation."""
+        if not self.captions or now < self.retry_at:
+            return None
+        utt = self.captions.pop(0)
+        if utt not in self.utts:
+            return None
+        words = [w["w"] for w in self.utts[utt]]
+        content = CAPTION_CHECK.format(utt=utt, words=" ".join(words))
+        return _cached(self.messages) + [{"role": "user", "content": content}], \
+            {"utt_id": utt, "words": words, "review": [], "sent": now, "lane": "caption"}
 
     def _touch(self, utt):
         if utt not in self.updated:
@@ -304,7 +395,7 @@ class Brain:
             parts.append("\n".join(f"Judge: {t}" for t in self.events))
         for utt in self.updated:
             words = self.utts.get(utt, [])
-            parts.append(f"Austin, utterance {utt}, locked so far:\n" + "\n".join(f"{i} {w['w']}" for i, w in enumerate(words)))
+            parts.append(f"Austin, utterance {utt}, locked so far:\n" + "\n".join(f"{i} {_shown(w)}" for i, w in enumerate(words)))
         if self.notes:
             parts.append("Your repair checks since the last message:\n" + "\n".join(self.notes))
         if self.fresh and self.unlocked:
@@ -343,20 +434,21 @@ class Brain:
         return dict(self.predict, ttl_s=PREDICT_TTL_S, t=now)
 
     def ask(self, messages=None, lane=None):
-        """Call Claude. messages=None: the conversation lane (the reply is appended); else a repair- or early-lane call on
+        """Call Claude. messages=None: the conversation lane (the reply is appended); else a repair-, live- or end-lane call on
         those messages (nothing appended). Runs off the main thread; returns (reply or None, log)."""
         lane = "conversation" if messages is None else (lane or "repair")
         msgs = self.messages if messages is None else messages
         t0 = time.perf_counter()
         log = {"stage": "claude", "lane": lane, "request": msgs[-1]["content"]}
         try:
-            schema = END_SCHEMA if lane == "end" else SCHEMA
+            schema = END_SCHEMA if lane == "end" else CAPTION_SCHEMA if lane == "caption" else SCHEMA
             common = dict(system=SYSTEM, messages=msgs, cache_control={"type": "ephemeral"},
                           output_config={"effort": "low", "format": {"type": "json_schema", "schema": schema}})
             if lane == "end":       # Haiku, one number back: the end check is on the clock (the sentence holds)
                 r = self.client.beta.messages.create(model=MODEL, max_tokens=END_MAX_TOKENS,
                                                      thinking={"type": "disabled"}, **common)
-            elif lane == "repair":  # Opus: Haiku swapped right words on the session 3 replay (0.8 edits a sentence)
+            elif lane in ("repair", "caption"):  # Opus: captions only, so its time costs nothing; Haiku swapped right
+                # words for wrong ones on the session 3 replay (0.8 edits a sentence)
                 r = self.client.beta.messages.create(model=REPAIR_MODEL, max_tokens=REPAIR_MAX_TOKENS,
                                                      betas=[FALLBACK_BETA], fallbacks="default", **common)
             else:
@@ -408,6 +500,9 @@ class Brain:
             self.notes = target.get("notes", []) + self.notes
             self.updated = [u for u in target.get("updated", []) if u in self.utts and u not in self.updated] + self.updated
             self.fresh = self.fresh or target.get("unlocked", False)
+        elif target.get("lane") == "caption":   # a caption pass is retried, unless refused
+            if not refused and target["utt_id"] in self.utts and target["utt_id"] not in self.captions:
+                self.captions.insert(0, target["utt_id"])
         else:  # a refused repair's words are not retried
             utt = target["utt_id"]
             if not refused and target["review"] and utt in self.utts:
@@ -432,6 +527,20 @@ class Brain:
         if target.get("lane") == "end":
             return [("claude.end", {"utt_id": target["utt_id"], "p_complete": _clip(reply["p_complete"]),
                                     "ask": target.get("ask"), "t": now})], []
+        if target.get("lane") == "caption":
+            utt, before = target["utt_id"], target["words"]
+            words = [w for w in _norm(reply["text"]).replace(",", " ").replace(".", " ").split() if w]
+            if not words:
+                return [], []
+            if words != before:     # the conversation hears the corrected sentence in its next message
+                self.notes.append(f"utterance {utt}, caption corrected: {' '.join(before)} -> {' '.join(words)}")
+                if utt in self.utts:
+                    self.utts[utt] = [{"w": w, "alts": [], "conf": None, "cam": None, "emg": None, "t": None}
+                                      for w in words]
+                    self.review.pop(utt, None)
+                    self._touch(utt)
+            return [("claude.caption", {"utt_id": utt, "words": words, "from": before, "changed": words != before,
+                                        "t": now})], []
         if sent >= self.predict_sent:
             self.predict = {
                 "words": [{"w": _norm(p["w"]), "weight": _clip(p["weight"])} for p in reply["predict_words"] if _norm(p["w"])],

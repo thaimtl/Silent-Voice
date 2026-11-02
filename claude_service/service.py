@@ -3,8 +3,8 @@ claude.repair, claude.end and timing.claude (with every request and reply, for t
 
 One conversation-lane call at a time, so the conversation stays append-only (whatever arrives meanwhile goes into
 the next one), and a repair-lane call for each dec.lock at once, up to brain.MAX_REPAIRS in flight (brain.py).
-While the judge is still speaking, their partial line (Cartesia Ink) starts early prediction calls, one at a time, so
-a prediction is ready before Austin starts mouthing (up to brain.MAX_EARLY in flight); the final line still goes
+A live prediction is always on its way (brain.py, live lane): on every new word of the judge's live line (Cartesia
+Ink), and otherwise as soon as the last one is back, up to brain.MAX_LIVE in flight; the final line still goes
 through the conversation lane.
 Each dec.pause (Austin's lips stopped; the decoder holds his sentence) starts an end-lane call, up to
 brain.MAX_END in flight, whose claude.end says how likely he has finished.
@@ -25,9 +25,9 @@ import threading
 
 import bus
 from bus.team import Pub, Sub
-from claude_service.brain import MAX_EARLY, MAX_END, MAX_REPAIRS, Brain
+from claude_service.brain import MAX_CAPTION, MAX_END, MAX_LIVE, MAX_REPAIRS, Brain
 
-TOPICS = ("partner.text", "dec.lock", "dec.hyp", "dec.pause")
+TOPICS = ("dec.sentence", "partner.text", "dec.lock", "dec.hyp", "dec.pause")
 MOUTHING_S = 0.5  # dec.hyp showed unlocked words this recently
 
 
@@ -105,7 +105,7 @@ def finish(brain, call, pub, now):
 
 def run(brain, sub, pub, stop=lambda: False):
     """sub: a bus.Sub on TOPICS; pub: a bus.Pub. Runs until stop() is true."""
-    convo, early, repairs, ends, last_mouth = None, [], [], [], -1e9  # one conversation call, MAX_EARLY early,
+    convo, live, repairs, ends, captions, last_mouth = None, [], [], [], [], -1e9  # one conversation call, MAX_LIVE live,
     # MAX_REPAIRS repairs, MAX_END end checks
     while not stop():
         timeout = 20
@@ -125,6 +125,8 @@ def run(brain, sub, pub, stop=lambda: False):
                         last_mouth = bus.now()
                 elif topic == "dec.pause":
                     brain.pause(msg)
+                elif topic == "dec.sentence":
+                    brain.sentence(msg)
             except Exception as e:  # one bad message must not stop the service
                 report(pub, f"bad message: {type(e).__name__}: {e}")
             timeout = 0
@@ -136,12 +138,22 @@ def run(brain, sub, pub, stop=lambda: False):
         if convo is not None and convo.done():
             finish(brain, convo, pub, now)
             convo = None
-        for call in [c for c in early if c.done()]:
+        for call in [c for c in live if c.done()]:
             finish(brain, call, pub, now)
-            early.remove(call)
+            live.remove(call)
         for call in [c for c in ends if c.done()]:
             finish(brain, call, pub, now)
             ends.remove(call)
+        for call in [c for c in captions if c.done()]:
+            finish(brain, call, pub, now)
+            captions.remove(call)
+        if len(captions) < MAX_CAPTION:   # a sentence closed: Opus rewrites its caption (never the voice)
+            try:
+                if (req := brain.next_caption(now)) is not None:
+                    captions.append(Call(brain, req[1], req[0]))
+            except Exception as e:
+                report(pub, f"caption request failed: {type(e).__name__}: {e}")
+                brain.captions = []
         if len(ends) < MAX_END:     # Austin's lips stopped: has he finished? (the decoder holds his sentence)
             try:
                 if (req := brain.next_end(now)) is not None:
@@ -149,12 +161,12 @@ def run(brain, sub, pub, stop=lambda: False):
             except Exception as e:
                 report(pub, f"end check failed: {type(e).__name__}: {e}")
                 brain.end = None
-        if len(early) < MAX_EARLY:   # the judge is still speaking: predict from their line so far
+        if len(live) < MAX_LIVE:   # a fresh prediction always on its way
             try:
-                if (req := brain.next_early(now)) is not None:
-                    early.append(Call(brain, req[1], req[0]))
+                if (req := brain.next_live(now, len(live))) is not None:
+                    live.append(Call(brain, req[1], req[0]))
             except Exception as e:
-                report(pub, f"early request failed: {type(e).__name__}: {e}")
+                report(pub, f"live request failed: {type(e).__name__}: {e}")
         while brain.review and len(repairs) < MAX_REPAIRS and now >= brain.retry_at:
             try:
                 messages, target = brain.next_review(now)
