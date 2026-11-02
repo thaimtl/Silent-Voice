@@ -374,9 +374,7 @@ class Launcher:
             self.uno = a.port or self.find_uno()
             check(bool(self.uno), f'Uno on {self.uno or "?"}', 'plug in its USB cable, pass --port COMx, or --no-emg')
             on_ac = charging()
-            if on_ac and getattr(a, 'allow_charger', False):
-                say('the laptop is charging: going ahead (--allow-charger)')
-            elif on_ac:
+            if on_ac:
                 say('the laptop is charging: unplug the charger before the pads go on skin (no USB isolator)', False)
                 problems.append('charger')
         return not problems
@@ -699,8 +697,6 @@ def main(argv=None):
     ap.add_argument('--exposure', type=lambda s: None if s == 'auto' else float(s), default=-7.0 if WINDOWS else None,
                     help="webcam exposure in DirectShow units, a stop darker than auto by default on Windows (-7; "
                          "'auto' for the camera's own, the default elsewhere)")
-    ap.add_argument('--allow-charger', action='store_true',
-                    help='start the pads with the charger plugged in (the new setup; default: refuse)')
     ap.add_argument('--port', default=None, help="the Uno's serial port, e.g. COM5 (default: found by itself)")
     ap.add_argument('--calibrate', type=float, default=0.0,
                     help='seconds of EMG calibration at the start, after re-padding (default 0: reuse the last one)')
