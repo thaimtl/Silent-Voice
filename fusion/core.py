@@ -490,7 +490,8 @@ class Fusion:
                                        [x['conf'] for x in prior + u.locked] + [x['p'] for x in words]):
             # a wrong guess beats "Please repeat"; but where only Claude's hint carried a word, the camera's own
             # reading goes to the voice (Claude predicts, it never decides a word the camera doesn't nearly agree on)
-            new = [dict(x, w=x['cam_top'], claude=0.0) if self._claude_only(x) else x for x in words]
+            new = [dict(x, w=x['cam_top'], cam=x['mc'].get(x['cam_top'], 0.0), claude=0.0,
+                        tokens=self.search.pieces.word_ids(x['cam_top'])) if self._claude_only(x) else x for x in words]
         else:
             for x in words:   # left to right: a word locks only after every word before it
                 if self._claude_only(x) or not self.lock.may_lock(x['f'], x['p'], tau):
