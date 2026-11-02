@@ -424,7 +424,7 @@ class Launcher:
             cam = self.module('venv-live', 'lipread.run', '--cam', str(a.cam), '--quiet')
             if self.face_adapter().exists():    # Austin's face: halves the camera's word errors (lipread/MEASURED.md)
                 cam += ['--face-adapter', str(self.face_adapter())]
-            if getattr(a, 'exposure', None) is not None:   # a stop under auto (-6 here) reads lips better (Oct 25)
+            if getattr(a, 'exposure', None) is not None:   # a stop under auto (~-6) reads lips better (Oct 25)
                 cam += ['--exposure', str(a.exposure)]
             parts.append(Part('Camera', cam + (['--camera-settings'] if a.camera_settings else []),
                               ('bus', ep['cam'], 'cam.preview'), 300 if a.camera_settings else 120))
@@ -696,8 +696,9 @@ def main(argv=None):
     ap.add_argument('--rehearse', action='store_true', help='no camera or pads: session 3 plays when a call connects')
     ap.add_argument('--cam', type=int, default=0, help='webcam index (default 0)')
     ap.add_argument('--camera-settings', action='store_true', help='Windows: lock exposure and focus in a dialog')
-    ap.add_argument('--exposure', type=lambda s: None if s == 'auto' else float(s), default=-7.0,
-                    help="webcam exposure, a stop darker than auto by default (-7; 'auto' for the camera's own)")
+    ap.add_argument('--exposure', type=lambda s: None if s == 'auto' else float(s), default=-7.0 if WINDOWS else None,
+                    help="webcam exposure in DirectShow units, a stop darker than auto by default on Windows (-7; "
+                         "'auto' for the camera's own, the default elsewhere)")
     ap.add_argument('--allow-charger', action='store_true',
                     help='start the pads with the charger plugged in (the new setup; default: refuse)')
     ap.add_argument('--port', default=None, help="the Uno's serial port, e.g. COM5 (default: found by itself)")
