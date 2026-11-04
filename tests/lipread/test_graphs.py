@@ -125,3 +125,15 @@ def test_an_uncaptured_length_reads_eagerly_and_leaves_the_graphs_intact(models,
     for T in (1, 100, 200):
         same, d = gap(graph.read(rois[:T]), eager.read(rois[:T]))
         assert same and d < TOL, (T, d)
+
+
+def test_a_failed_capture_falls_back_to_eager_reads(monkeypatch, rois):
+    def no_memory(self, lengths):
+        self.graphs[1] = 'half captured'
+        raise RuntimeError('CUDA out of memory. Tried to allocate 2.00 GiB\nmore detail')
+    monkeypatch.setattr(LiveModel, '_capture', no_memory)
+    model = LiveModel(half=True, warmup=(1, 50))
+    assert model.graphs == {} and model.graphs_error == 'CUDA out of memory. Tried to allocate 2.00 GiB'
+    eager = LiveModel(half=True, warmup=(1, 50), graphs=False)
+    a, b = model.read(rois[:50]), eager.read(rois[:50])
+    assert np.array_equal(a.topk_logp, b.topk_logp)
