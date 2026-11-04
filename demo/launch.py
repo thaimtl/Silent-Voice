@@ -376,12 +376,15 @@ class Launcher:
                 check(self.face_adapter().exists(), f'face adapter {FACE_ADAPTER.as_posix()}',
                       f'copy {FACE_ADAPTER.name} from the bucket into data/face_adapter/, or pass --allow-base-model')
         if not (a.no_emg or a.rehearse):
+            # neither blocks the start (Austin, Nov 4): no Uno runs without the pads, the charger only warns
             self.uno = a.port or self.find_uno()
-            check(bool(self.uno), f'Uno on {self.uno or "?"}', 'plug in its USB cable, pass --port COMx, or --no-emg')
-            on_ac = charging()
-            if on_ac:
-                say('the laptop is charging: unplug the charger before the pads go on skin (no USB isolator)', False)
-                problems.append('charger')
+            if self.uno:
+                say(f'Uno on {self.uno}', True)
+            else:
+                say('no Uno found: starting without the pads (plug in its USB cable, or pass --port COMx)', None)
+                a.no_emg = True
+            if self.uno and charging():
+                say('the laptop is charging: going ahead with the pads on the charger', None)
         return not problems
 
     def face_adapter(self):
