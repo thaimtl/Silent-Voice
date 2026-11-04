@@ -361,10 +361,10 @@ def test_size_flags_reach_the_camera(monkeypatch):
     monkeypatch.setattr(lipread.source, 'CameraSource', lambda cam, **kw: got.update(cam=cam, **kw) or 'cam')
     args = parse_args([])
     assert args.size == (1920, 1080) and args.process_size == (1280, 720)
-    assert make_source(args) == 'cam' and got == {'cam': 0, 'width': 1920, 'height': 1080, 'settings': False}
+    assert make_source(args) == 'cam' and got == {'cam': 0, 'width': 1920, 'height': 1080, 'settings': False, 'exposure': None}
     args = parse_args(['--cam', '2', '--size', '1280x720', '--process-size', '0', '--camera-settings'])
     make_source(args)
-    assert got == {'cam': 2, 'width': 1280, 'height': 720, 'settings': True} and args.process_size is None
+    assert got == {'cam': 2, 'width': 1280, 'height': 720, 'settings': True, 'exposure': None} and args.process_size is None
     with pytest.raises(SystemExit):
         parse_args(['--size', '1280'])
 
