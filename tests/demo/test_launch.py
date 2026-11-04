@@ -283,9 +283,9 @@ def test_the_camera_loads_the_face_adapter_when_it_is_there(tmp_path, monkeypatc
         assert lc.preflight()    # not a blocker: the base model still reads
     assert 'no face adapter at' in out.getvalue()
     (tmp_path / 'data' / 'face_adapter').mkdir(parents=True)
-    (tmp_path / 'data' / 'face_adapter' / 'austin.pth').write_bytes(b'')
+    (tmp_path / 'data' / 'face_adapter' / 'austin_C_s12_soup8.pth').write_bytes(b'')
     cam = next(p for p in lc.plan() if p.name == 'Camera').cmd
-    assert cam[cam.index('--face-adapter') + 1] == str(tmp_path / 'data' / 'face_adapter' / 'austin.pth')
+    assert cam[cam.index('--face-adapter') + 1] == str(tmp_path / 'data' / 'face_adapter' / 'austin_C_s12_soup8.pth')
 
 
 def test_record_inbound_is_always_off(tmp_path, monkeypatch):

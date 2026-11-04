@@ -1,5 +1,6 @@
 """The face adapter: lipread/adapt.py's data handling, and LiveModel loading an adapter over the base weights."""
 import json
+import os
 
 import numpy as np
 import pytest
@@ -92,6 +93,24 @@ def test_a_file_with_other_tensors_is_refused(tmp_path, adapter_file):
         load_face_adapter(reader.model, str(tmp_path / 'bad.pth'))
 
 
+def test_averaged_adapters_are_the_mean_and_mismatched_files_are_refused(tmp_path, adapter_file):
+    import torch
+    from lipread.average_adapters import main
+    path, state = adapter_file
+    other = {k: v + 1.0 if v.is_floating_point() else v for k, v in state.items()}
+    other['encoder.embed.num_batches_tracked'] = torch.tensor(7)
+    first = dict(state, **{'encoder.embed.num_batches_tracked': torch.tensor(3)})
+    torch.save(first, tmp_path / 'a.pth')
+    torch.save(other, tmp_path / 'b.pth')
+    main([str(tmp_path / 'soup.pth'), str(tmp_path / 'a.pth'), str(tmp_path / 'b.pth')])
+    soup = torch.load(tmp_path / 'soup.pth', weights_only=True)
+    k = next(iter(state))
+    assert torch.allclose(soup[k], state[k] + 0.5, atol=1e-6) and soup['encoder.embed.num_batches_tracked'] == 3
+    torch.save({k: state[k]}, tmp_path / 'c.pth')
+    with pytest.raises(ValueError, match='same tensors'):
+        main([str(tmp_path / 'bad.pth'), str(tmp_path / 'a.pth'), str(tmp_path / 'c.pth')])
+
+
 class FakeReader:
     """Enough of a LipReader for word_ends: 4 tokens, two words, 'A' = 1 token, 'BC' = 2 tokens."""
     token_list = ['<blank>', '▁A', '▁B', 'C']
@@ -135,6 +154,17 @@ def test_word_ends_are_cached_and_a_hit_skips_the_encoder(tmp_path):
     word_ends(reader, rois, [1, 2, 3], 'clip_2', cache)
     assert reader.encoded == 2
     assert load_alignments(str(tmp_path / 'none.json')) == {}
+
+
+def test_concurrent_saves_of_one_alignment_cache_all_succeed(tmp_path):
+    from concurrent.futures import ThreadPoolExecutor
+    from lipread.adapt import load_alignments, save_alignments
+    path = str(tmp_path / 'align.json')
+    caches = [{f'clip_{i}': dict(words=['A'], starts=[0], ends=[1])} for i in range(8)]
+    with ThreadPoolExecutor(8) as pool:
+        list(pool.map(lambda c: [save_alignments(path, c) for _ in range(50)], caches))
+    assert load_alignments(path) in caches
+    assert sorted(os.listdir(tmp_path)) == ['align.json']
 
 
 def test_recipe_c_is_the_default_and_flags_override_it():
