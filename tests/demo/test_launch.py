@@ -265,12 +265,9 @@ def test_plan_follows_the_flags(tmp_path):
     assert names(rehearse) == ['Logger', 'Decoder'] and {'--no-emg', '--no-claude'} <= set(rehearse.plan()[-1].cmd)
 
 
-def test_the_camera_loads_the_face_adapter_when_it_is_there(tmp_path, monkeypatch):
-    lc = launcher(tmp_path)
-    assert '--face-adapter' not in next(p for p in lc.plan() if p.name == 'Camera').cmd
+def test_preflight_needs_the_face_adapter_and_the_camera_loads_it(tmp_path, monkeypatch):
     keys = tmp_path / 'keys.env'
     keys.write_text('')
-    lc.keys = {k: 'x' for k in launch.NEEDED_KEYS}
     monkeypatch.setattr(launch, 'KEYS', keys)
     monkeypatch.setattr(launch, 'venv_python', lambda work, venv: keys)
     monkeypatch.setattr(launch, 'gpu_ok', lambda: True)
@@ -278,14 +275,23 @@ def test_the_camera_loads_the_face_adapter_when_it_is_there(tmp_path, monkeypatc
     monkeypatch.setattr(Launcher, 'cloudflared', lambda self: 'cloudflared')
     monkeypatch.setattr(Launcher, 'camera_opens', lambda self: True)
     monkeypatch.setattr(Launcher, 'find_uno', lambda self: 'COM9')
-    out = io.StringIO()
-    with redirect_stdout(out):
-        assert lc.preflight()    # not a blocker: the base model still reads
-    assert 'no face adapter at' in out.getvalue()
-    (tmp_path / 'data' / 'face_adapter').mkdir(parents=True)
-    (tmp_path / 'data' / 'face_adapter' / 'austin_C_s12_soup8.pth').write_bytes(b'')
-    cam = next(p for p in lc.plan() if p.name == 'Camera').cmd
-    assert cam[cam.index('--face-adapter') + 1] == str(tmp_path / 'data' / 'face_adapter' / 'austin_C_s12_soup8.pth')
+
+    def preflight(**kw):
+        lc = launcher(tmp_path, **kw)
+        lc.keys = {k: 'x' for k in launch.NEEDED_KEYS}
+        out = io.StringIO()
+        with redirect_stdout(out):
+            ok = lc.preflight()
+        return ok, out.getvalue(), next(p for p in lc.plan() if p.name == 'Camera').cmd
+
+    ok, out, cam = preflight()
+    assert not ok and f'face adapter {launch.FACE_ADAPTER.as_posix()}: copy' in out and '--face-adapter' not in cam
+    ok, out, cam = preflight(allow_base_model=True)
+    assert ok and 'no face adapter at' in out and '--face-adapter' not in cam
+    (tmp_path / launch.FACE_ADAPTER).parent.mkdir(parents=True)
+    (tmp_path / launch.FACE_ADAPTER).write_bytes(b'')
+    ok, out, cam = preflight()
+    assert ok and cam[cam.index('--face-adapter') + 1] == str(tmp_path / launch.FACE_ADAPTER)
 
 
 def test_record_inbound_is_always_off(tmp_path, monkeypatch):
