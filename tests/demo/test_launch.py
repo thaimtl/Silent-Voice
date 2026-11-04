@@ -5,7 +5,9 @@
 import io
 import os
 import json
+import signal
 import socket
+import subprocess
 import sys
 import time
 import types
@@ -263,6 +265,35 @@ def test_plan_follows_the_flags(tmp_path):
     assert names(rehearse) == ['Logger', 'Decoder'] and {'--no-emg', '--no-claude'} <= set(rehearse.plan()[-1].cmd)
 
 
+def test_preflight_needs_the_face_adapter_and_the_camera_loads_it(tmp_path, monkeypatch):
+    keys = tmp_path / 'keys.env'
+    keys.write_text('')
+    monkeypatch.setattr(launch, 'KEYS', keys)
+    monkeypatch.setattr(launch, 'venv_python', lambda work, venv: keys)
+    monkeypatch.setattr(launch, 'gpu_ok', lambda: True)
+    monkeypatch.setattr(launch, 'charging', lambda: False)
+    monkeypatch.setattr(Launcher, 'cloudflared', lambda self: 'cloudflared')
+    monkeypatch.setattr(Launcher, 'camera_opens', lambda self: True)
+    monkeypatch.setattr(Launcher, 'find_uno', lambda self: 'COM9')
+
+    def preflight(**kw):
+        lc = launcher(tmp_path, **kw)
+        lc.keys = {k: 'x' for k in launch.NEEDED_KEYS}
+        out = io.StringIO()
+        with redirect_stdout(out):
+            ok = lc.preflight()
+        return ok, out.getvalue(), next(p for p in lc.plan() if p.name == 'Camera').cmd
+
+    ok, out, cam = preflight()
+    assert not ok and f'face adapter {launch.FACE_ADAPTER.as_posix()}: copy' in out and '--face-adapter' not in cam
+    ok, out, cam = preflight(allow_base_model=True)
+    assert ok and 'no face adapter at' in out and '--face-adapter' not in cam
+    (tmp_path / launch.FACE_ADAPTER).parent.mkdir(parents=True)
+    (tmp_path / launch.FACE_ADAPTER).write_bytes(b'')
+    ok, out, cam = preflight()
+    assert ok and cam[cam.index('--face-adapter') + 1] == str(tmp_path / launch.FACE_ADAPTER)
+
+
 def test_record_inbound_is_always_off(tmp_path, monkeypatch):
     monkeypatch.setenv('RECORD_INBOUND', 'inbound.ulaw')
     assert launcher(tmp_path).env['RECORD_INBOUND'] == ''
@@ -343,3 +374,71 @@ def test_no_repair_window_by_default():
     finally:
         argparse.ArgumentParser.parse_args = real
     assert seen['ns'].repair_s == 0.0
+
+
+@pytest.mark.parametrize('exits', [True, False])
+def test_windows_stop_sends_ctrl_break_then_kills_the_tree(monkeypatch, exits):
+    sent, ran = [], []
+
+    class Proc:
+        pid, returncode = 4242, None
+
+        def poll(self):
+            return self.returncode
+
+        def send_signal(self, sig):
+            sent.append(sig)
+
+        def wait(self, timeout=None):
+            if exits or ran:
+                self.returncode = 0
+                return 0
+            raise subprocess.TimeoutExpired('part', timeout)
+    monkeypatch.setattr(launch, 'WINDOWS', True)
+    monkeypatch.setattr(signal, 'CTRL_BREAK_EVENT', 1, raising=False)
+    monkeypatch.delattr(os, 'killpg')
+    monkeypatch.setattr(launch.subprocess, 'run', lambda cmd, **kw: ran.append(cmd))
+    p = Part('Camera', [], ('line', 'x'))
+    p.proc = Proc()
+    p.stop(grace_s=0.01)
+    assert sent == [1] and p.proc.returncode == 0
+    assert ran == ([] if exits else [['taskkill', '/T', '/F', '/PID', '4242']])
+
+
+def test_windows_start_puts_each_part_in_its_own_process_group(tmp_path, monkeypatch):
+    seen = {}
+
+    def popen(cmd, **kw):
+        seen.update(kw)
+        return types.SimpleNamespace(poll=lambda: None)
+    monkeypatch.setattr(launch, 'WINDOWS', True)
+    monkeypatch.setattr(subprocess, 'CREATE_NEW_PROCESS_GROUP', 0x200, raising=False)
+    monkeypatch.setattr(launch.subprocess, 'Popen', popen)
+    Part('Camera', ['x'], ('line', 'x')).start(tmp_path, {})
+    assert seen['creationflags'] == 0x200 and 'start_new_session' not in seen
+
+
+def test_run_part_turns_ctrl_break_into_ctrl_c(monkeypatch):
+    from demo import run_part
+    set_to, ran = {}, []
+    monkeypatch.setattr(signal, 'SIGBREAK', signal.SIGUSR1, raising=False)
+    monkeypatch.setattr(signal, 'signal', lambda sig, handler: set_to.__setitem__(sig, handler))
+    monkeypatch.setattr(run_part.runpy, 'run_module', lambda name, **kw: ran.append((name, kw['run_name'])))
+    monkeypatch.setattr(sys, 'argv', ['run_part', 'lipread.run', '--cam', '0'])
+    run_part.main()
+    assert set_to == {signal.SIGUSR1: signal.default_int_handler}
+    assert ran == [('lipread.run', '__main__')] and sys.argv == ['lipread.run', '--cam', '0']
+
+
+@pytest.mark.parametrize('ac, on_charger', [(1, True), (0, False)])
+def test_windows_charging_reads_the_power_status(monkeypatch, ac, on_charger):
+    import ctypes
+
+    def status(s):
+        s.ACLineStatus = ac
+        return 1
+    monkeypatch.setattr(launch, 'WINDOWS', True)
+    monkeypatch.setattr(ctypes, 'byref', lambda s: s)
+    monkeypatch.setattr(ctypes, 'windll', types.SimpleNamespace(kernel32=types.SimpleNamespace(
+        GetSystemPowerStatus=status)), raising=False)
+    assert launch.charging() is on_charger

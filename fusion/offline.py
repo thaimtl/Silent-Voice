@@ -129,7 +129,7 @@ def build_search(lm_path=None, lookalike_vocab=50000):
 
 
 def run_session(session, cam_log, svr_path, gate, lock, use_emg=True, use_lm=True, record=True, no_lock=False,
-                max_filled=0.05, limit=None, progress=True):
+                max_filled=0.05, limit=None, progress=True, emg_async=True):
     """Feed one recorded session through Fusion; returns (records, published messages, rows used)."""
     from fusion.core import Fusion
     from svr.finetune import usable_record
@@ -154,7 +154,7 @@ def run_session(session, cam_log, svr_path, gate, lock, use_emg=True, use_lm=Tru
         return r['prompt'] if r is not None and r.get('prompt') and r['id'] in ok_ids else None
 
     core = Fusion(search, gate, lock, svr=live, use_emg=use_emg, use_lm=use_lm, use_hints=False, idle_emg=False,
-                  record=record, oracle=oracle, sentences=False)   # scored per recorded clip
+                  record=record, oracle=oracle, sentences=False, emg_async=emg_async)   # scored per recorded clip
     cam = camera_events(cam_log)
     if limit:
         segs = sorted({int(m['seg_id']) for _, tp, m in cam if tp == 'cam.tick'})[:limit]
@@ -535,7 +535,7 @@ def cmd_test(a):
     for name, emg, lmon in configs:
         g, lk, _ = load_params(a.params)
         recs, out, windows = run_session(a.session, a.cam_log, a.svr, g, lk, use_emg=emg, use_lm=lmon, record=True,
-                                         limit=a.limit)
+                                         limit=a.limit, emg_async=not a.emg_sync)
         by_utt = {}
         for r in recs:
             by_utt.setdefault(r['utt_id'], []).append(r)
@@ -573,6 +573,13 @@ def cmd_test(a):
                              delay_median_s=float(np.median(delays)) if delays else None,
                              delay_p90_s=float(np.percentile(delays, 90)) if delays else None,
                              pass_ms_median=float(np.median(ms)), pass_ms_p95=float(np.percentile(ms, 95)))
+        tick = [r for r in recs if not r['final']]
+        if tick:    # tick passes, and the same without waiting for SVR-1 (live, an async read ends between ticks)
+            tm = [r['ms'] for r in tick]
+            tw = [r['ms'] - r.get('emg_wait_ms', 0.0) for r in tick]
+            results[name].update(tick_ms_median=float(np.median(tm)), tick_ms_p95=float(np.percentile(tm, 95)),
+                                 tick_nowait_ms_median=float(np.median(tw)),
+                                 tick_nowait_ms_p95=float(np.percentile(tw, 95)))
         print(name, json.dumps(results[name]), flush=True)
     # reference: the camera's own final pass (cam.final's best) on the same sentences
     import buslog
@@ -588,7 +595,7 @@ def cmd_test(a):
     os.makedirs(os.path.dirname(os.path.abspath(a.out)), exist_ok=True)
     with open(a.out, 'w') as f:
         json.dump({'session': a.session, 'cam_log': a.cam_log, 'svr': a.svr, 'params': a.params,
-                   'results': results}, f, indent=1)
+                   'emg_sync': a.emg_sync, 'results': results}, f, indent=1)
     print(f'saved {a.out}')
 
 
@@ -625,6 +632,7 @@ def main(argv=None):
     q.add_argument('--params', default=PARAMS)
     q.add_argument('--out', default=os.path.join(WORK, 'benchmark_results', 'FUSION_TEST', 'summary.json'))
     q.add_argument('--limit', type=int, default=None)
+    q.add_argument('--emg-sync', action='store_true', help='each pass waits for its own SVR-1 read (the old path)')
     q.set_defaults(fn=cmd_test)
     a = p.parse_args(argv)
     a.fn(a)

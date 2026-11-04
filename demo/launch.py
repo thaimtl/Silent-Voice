@@ -49,6 +49,7 @@ BUS_PORTS = {'emg': 5555, 'cam': 5556, 'dec': 5557, 'claude': 5558, 'call': 5559
 CALL_PORT, DASH_PORT = 8787, 8790
 MAX_RESTARTS = 3
 REHEARSAL_LOG = 'cam_s3_test'
+FACE_ADAPTER = Path('data', 'face_adapter', 'austin_C_s12_soup8.pth')
 TUNNEL_URL = re.compile(r'https://(?!api\.)[a-z0-9-]+\.trycloudflare\.com')   # not cloudflared's own API
 
 
@@ -367,9 +368,13 @@ class Launcher:
                   'copy it from Frank, or run without --rehearse')
         else:
             check(self.camera_opens(), f'webcam {a.cam}', 'plug in the C920, close other apps using it, or pass --cam 1')
-            if not self.face_adapter().exists():    # not a blocker: the base model still reads, at twice the errors
-                say(f'no face adapter at {self.face_adapter()}: the camera reads with the base model (2x the word '
-                    'errors); copy it from the bucket', None)
+            if getattr(a, 'allow_base_model', False):    # the base model still reads, at twice the word errors
+                if not self.face_adapter().exists():
+                    say(f'no face adapter at {self.face_adapter()}: the camera reads with the base model '
+                        '(--allow-base-model, 2x the word errors)', None)
+            else:   # blocks: the demo once ran for hours without it, unnoticed
+                check(self.face_adapter().exists(), f'face adapter {FACE_ADAPTER.as_posix()}',
+                      f'copy {FACE_ADAPTER.name} from the bucket into data/face_adapter/, or pass --allow-base-model')
         if not (a.no_emg or a.rehearse):
             self.uno = a.port or self.find_uno()
             check(bool(self.uno), f'Uno on {self.uno or "?"}', 'plug in its USB cable, pass --port COMx, or --no-emg')
@@ -380,7 +385,7 @@ class Launcher:
         return not problems
 
     def face_adapter(self):
-        return self.work / 'data' / 'face_adapter' / 'austin.pth'
+        return self.work / FACE_ADAPTER
 
     def cloudflared(self):
         for p in (shutil.which('cloudflared'), self.work / ('cloudflared.exe' if WINDOWS else 'cloudflared'),
@@ -693,6 +698,8 @@ def main(argv=None):
     ap.add_argument('--no-claude', action='store_true', help='without Claude (fallback)')
     ap.add_argument('--rehearse', action='store_true', help='no camera or pads: session 3 plays when a call connects')
     ap.add_argument('--cam', type=int, default=0, help='webcam index (default 0)')
+    ap.add_argument('--allow-base-model', action='store_true',
+                    help='start without the face adapter (the camera then makes about twice the word errors)')
     ap.add_argument('--camera-settings', action='store_true', help='Windows: lock exposure and focus in a dialog')
     ap.add_argument('--exposure', type=lambda s: None if s == 'auto' else float(s), default=-7.0 if WINDOWS else None,
                     help="webcam exposure in DirectShow units, a stop darker than auto by default on Windows (-7; "
