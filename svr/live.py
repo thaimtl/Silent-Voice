@@ -5,6 +5,7 @@
     on every emg.raw message:   live.feed(msg['samples'], msg['t0'])
     every 100 ms:               out = live.read(camera_active=...)
     for disputed words:         live.verify(['i need to go', 'i need to know'])
+    on another thread:          w = live.window(start_t) now; out = live.read(True, start_t, window=w) later
 
 No bus code here: the fusion process subscribes to `emg.raw` and calls this. The filter is rig/filters.py, run once per
 sample as samples arrive (state kept across messages), exactly as in training; slots, gain and soft clip are
@@ -20,6 +21,7 @@ Segments start when the speaking probability (or the camera's mouth activity) ri
 0.5 s with neither; the read where one starts says so (segment_started) and the read where one ends too (segment_ended).
 """
 import difflib
+import threading
 import time
 
 import numpy as np
@@ -77,12 +79,16 @@ class LiveSVR1:
         self.gap_s = gap_seconds
         self.seg_id, self.seg_start, self.win_start, self.last_active = 0, None, None, None
         self.last_out = None
+        self.resets = 0
+        self._seg = threading.Lock()    # the segmentation: read() may run on another thread than feed()'s reset()
 
     def reset(self):
         """Forget the signal (a gap in the stream): the filter restarts and nothing before now is read again."""
         self.filter = rig_filters.EmgFilter()
         self.n, self.clock = 0, None
-        self.seg_start = self.win_start = self.last_active = None
+        with self._seg:
+            self.seg_start = self.win_start = self.last_active = None
+            self.resets += 1
         self.last_out = None
 
     # ------------------------------------------------------------------ input
@@ -107,6 +113,18 @@ class LiveSVR1:
         start = max(start, self.n - self.size + 1, 0)
         idx = np.arange(start, self.n) % self.size
         return start, self.ring[idx]
+
+    def _snap(self, first):
+        start, f1k = self._window(first)
+        return {'n': self.n, 'clock': self.clock, 'resets': self.resets, 'start': start, 'f1k': f1k}
+
+    def window(self, start_t):
+        """A copy of the signal a read from start_t sees now (up to max_seconds back), for read(window=) to run on
+        another thread later: whatever feed() adds meanwhile, that read is the same. None before any data."""
+        if self.clock is None:
+            return None
+        i0, t0 = self.clock
+        return self._snap(max(i0 + int(round((float(start_t) - t0) * EMG_RATE)), self.n - self.max_s))
 
     # ------------------------------------------------------------------ calibration
     def calibrate(self, raw, speak_threshold=None):
@@ -140,24 +158,25 @@ class LiveSVR1:
         with torch.autocast('cuda', dtype=torch.float16, enabled=str(self.device).startswith('cuda')):
             return self.model(xt, torch.tensor([n], device=self.device), self.cmask)
 
-    def read(self, camera_active=False, start_t=None):
+    def read(self, camera_active=False, start_t=None, window=None):
         """Re-read the current segment (or the idle window) and update the segmentation. None until enough data.
         start_t: read from this time instead (the fusion process passes the camera's segment start, so both readers
-        grade the same span; up to max_seconds back)."""
+        grade the same span; up to max_seconds back). window: the signal window(start_t) copied earlier (default:
+        now)."""
         if self.gain is None:
             raise RuntimeError('no session gain: load a fine-tuned checkpoint or call calibrate() first')
-        if self.clock is None:
+        if window is None and start_t is not None:
+            window = self.window(start_t)
+        elif window is None and self.clock is not None:
+            with self._seg:
+                if self.seg_start is not None and self.n - self.win_start > self.max_s:
+                    self.win_start = self.n - self.ctx_s
+                window = self._snap(self.win_start if self.seg_start is not None else self.n - self.idle_s)
+        if window is None:
             return None
         t_start = time.perf_counter()
-        in_seg = self.seg_start is not None
-        if in_seg and self.n - self.win_start > self.max_s:
-            self.win_start = self.n - self.ctx_s
-        if start_t is not None:
-            i0, t0 = self.clock
-            first = max(i0 + int(round((float(start_t) - t0) * EMG_RATE)), self.n - self.max_s)
-        else:
-            first = self.win_start if in_seg else self.n - self.idle_s
-        start, f1k = self._window(first)
+        n, (i0, t0), start, f1k = window['n'], window['clock'], window['start'], window['f1k']
+        time_of = lambda i: t0 + (i - i0) / EMG_RATE  # noqa: E731
         if len(f1k) < 2 * SAMPLES_PER_FRAME * EMG_RATE / RAW_RATE:
             return None
         x = resample_linear(rig_to_slots(f1k), RAW_RATE)
@@ -165,48 +184,56 @@ class LiveSVR1:
         out = self._forward(x)
         self.last_out = out
         frames = int(out['lengths'][0])
-        frame_t = self.time_of(start) + (np.arange(frames) * SAMPLES_PER_FRAME + SAMPLES_PER_FRAME / 2) / RAW_RATE
+        frame_t = time_of(start) + (np.arange(frames) * SAMPLES_PER_FRAME + SAMPLES_PER_FRAME / 2) / RAW_RATE
         speak = (torch.sigmoid(out['speak_logit'][0]).float().cpu().numpy() if 'speak_logit' in out
                  else np.ones(frames, np.float32))
         rms = frame_rms(x)
         z = float(out['rate'][0])
-        now_t = self.time_of(self.n)
+        now_t = time_of(n)
         recent = speak[-EFFORT_FRAMES:]
         active = bool(recent.mean() > self.thr) or camera_active
-        ended = started = False
-        if not in_seg and active:  # speech started: open a segment 300 ms before the run of speaking frames
-            run = len(speak)
-            while run > 0 and speak[run - 1] > self.thr:
-                run -= 1
-            t_on = frame_t[run] if run < frames else now_t
-            self.seg_id += 1
-            self.seg_start = t_on - self.pre_roll
-            self.win_start = max(start, self.clock[0] + int(round((self.seg_start - self.clock[1]) * EMG_RATE)))
-            self.last_active = now_t
-            started = True
-        elif in_seg:
-            if active:
-                self.last_active = now_t
-            elif now_t - self.last_active >= self.end_silence:
-                ended = True
-                self.seg_start = self.win_start = None
+        ended = started = in_seg = False
+        with self._seg:
+            if window['resets'] == self.resets:     # else the stream had a gap since: this signal is gone
+                in_seg = self.seg_start is not None
+                if in_seg and n - self.win_start > self.max_s:
+                    self.win_start = n - self.ctx_s
+                if not in_seg and active:  # speech started: open a segment 300 ms before the run of speaking frames
+                    run = len(speak)
+                    while run > 0 and speak[run - 1] > self.thr:
+                        run -= 1
+                    t_on = frame_t[run] if run < frames else now_t
+                    self.seg_id += 1
+                    self.seg_start = t_on - self.pre_roll
+                    self.win_start = max(start, i0 + int(round((self.seg_start - t0) * EMG_RATE)))
+                    self.last_active = now_t
+                    started = True
+                elif in_seg:
+                    if active:
+                        self.last_active = now_t
+                    elif now_t - self.last_active >= self.end_silence:
+                        ended = True
+                        self.seg_start = self.win_start = None
+            seg_id, seg_start = self.seg_id, self.seg_start
         # on the read where speech starts, the segment is reported at once (this read covered the idle window;
         # frame_t says where each frame falls); the next read covers the segment from seg_start
-        return {'seg_id': self.seg_id, 'in_segment': (in_seg and not ended) or started, 'segment_started': started,
-                'segment_ended': ended, 'seg_start': self.seg_start if (in_seg or started) else None, 'frame_t': frame_t,
+        return {'seg_id': seg_id, 'in_segment': (in_seg and not ended) or started, 'segment_started': started,
+                'segment_ended': ended, 'seg_start': seg_start if (in_seg or started) else None, 'frame_t': frame_t,
                 'letter_logp': out['letter_logp'][0].float().cpu().numpy(),
                 'phone_logp': out['phone_logp'][0].float().cpu().numpy(),
                 'speak_prob': speak, 'rate_z': z, 'pace': float(np.exp(RATE_SCALE * z)) / self.pace_ref,
                 'effort': float(rms[-1] / self.effort_ref) if self.effort_ref else None,
-                'timing_ms': (time.perf_counter() - t_start) * 1000}
+                'out': out, 'timing_ms': (time.perf_counter() - t_start) * 1000}
 
     @torch.no_grad()
-    def verify(self, candidates):
-        """S_emg of each candidate sentence (letter + phoneme CTC + verifier) on the last read's window."""
-        if self.last_out is None:
+    def verify(self, candidates, out=None):
+        """S_emg of each candidate sentence (letter + phoneme CTC + verifier) on a read's window: out, that read's
+        'out' (default: the last read's)."""
+        out = self.last_out if out is None else out
+        if out is None:
             raise RuntimeError('read() first')
         cands = [' '.join(clean_text(c).split()) for c in candidates]
-        s, _ = self.model.score_candidates(self.last_out, 0, *self._targets(cands))
+        s, _ = self.model.score_candidates(out, 0, *self._targets(cands))
         return s.float().cpu().numpy()
 
     def _targets(self, cands):

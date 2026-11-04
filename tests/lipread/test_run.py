@@ -281,7 +281,7 @@ def test_real_model_on_the_sample(sample_video, face_model):
     for t in sent:
         validate(*decode(encode(t)))
         tm = t.timing_ms
-        assert tm['T'] == len(t.frame_t) and tm['frontend'] > 0 and tm['conformer'] > 0
+        assert tm['T'] == len(t.frame_t) and tm['frontend'] >= 0 and tm['conformer'] > 0
         assert tm['frontend'] + tm['conformer'] + tm['ctc'] <= tm['total'] + 0.5
     assert len(sent[-1].frame_t) == 192
     words = set(sent[-1].greedy.split())

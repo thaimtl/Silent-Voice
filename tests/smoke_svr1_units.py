@@ -234,6 +234,26 @@ def pipeline_checks():
         check('the read where a segment starts reports it at once', first['in_segment'] and first['seg_start'] is not None)
         s = live.verify(['hello world', 'yellow word'])
         check('live verify scores candidates', s.shape == (2,) and np.isfinite(s).all())
+        check("verify on a read's own output is verify after that read", np.array_equal(
+            s, live.verify(['hello world', 'yellow word'], o['out'])))
+
+        # fusion reads on another thread: a read of a window taken earlier ignores what feed() added since
+        live2 = LiveSVR1(path, device='cpu')
+        live2.gain, live2.effort_ref, live2.pace_ref = live.gain, live.effort_ref, live.pace_ref
+        for i in range(0, 2000, 10):
+            live2.feed(raw[i:i + 10], t0=100.0 + i / 1000)
+        now = live2.read(True, 100.5)
+        w = live2.window(100.5)
+        live2.feed(raw[2000:2300], t0=102.0)
+        late = live2.read(True, 100.5, window=w)
+        check('a read of an earlier window equals the read made then',
+              all(np.array_equal(now[k], late[k]) for k in ('frame_t', 'letter_logp', 'phone_logp', 'speak_prob'))
+              and now['pace'] == late['pace'] and now['effort'] == late['effort'])
+        w = live2.window(100.5)
+        live2.feed(raw[2300:2400], t0=103.0)      # a gap in the stream: reset() between the window and its read
+        gone = live2.read(True, 100.5, window=w)
+        check('a window from before a gap still reads, but moves no segment',
+              gone is not None and not gone['segment_started'] and not gone['in_segment'] and live2.seg_start is None)
 
 
 if __name__ == '__main__':

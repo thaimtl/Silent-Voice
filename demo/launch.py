@@ -49,6 +49,7 @@ BUS_PORTS = {'emg': 5555, 'cam': 5556, 'dec': 5557, 'claude': 5558, 'call': 5559
 CALL_PORT, DASH_PORT = 8787, 8790
 MAX_RESTARTS = 3
 REHEARSAL_LOG = 'cam_s3_test'
+FACE_ADAPTER = Path('data', 'face_adapter', 'austin.pth')
 TUNNEL_URL = re.compile(r'https://(?!api\.)[a-z0-9-]+\.trycloudflare\.com')   # not cloudflared's own API
 
 
@@ -380,7 +381,7 @@ class Launcher:
         return not problems
 
     def face_adapter(self):
-        return self.work / 'data' / 'face_adapter' / 'austin.pth'
+        return self.work / FACE_ADAPTER
 
     def cloudflared(self):
         for p in (shutil.which('cloudflared'), self.work / ('cloudflared.exe' if WINDOWS else 'cloudflared'),
