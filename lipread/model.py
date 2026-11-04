@@ -22,6 +22,7 @@ the whole read would not do: the cached front end is only equal to a whole-segme
 Conformer blocks grow to ~0.9 nats (fp16). Lengths outside the captured set read eagerly.
 """
 import statistics
+import sys
 import time
 from dataclasses import dataclass
 
@@ -121,10 +122,20 @@ class LiveModel:
         t0 = time.perf_counter()
         if graphs is None:
             graphs = self.device.type == 'cuda'
+        self.graphs_error = None
         if graphs:
             self._norm = torch.tensor([255.0, _MEAN, _STD], device=self.device)
-            self._capture(tuple(warmup))
-        else:
+            try:
+                self._capture(tuple(warmup))
+            except RuntimeError as e:   # e.g. out of memory on a small GPU: read eagerly instead of not starting
+                self.graphs_error = str(e).splitlines()[0]
+                print(f'lipread: CUDA graph capture failed ({self.graphs_error}); eager reads', file=sys.stderr,
+                      flush=True)
+                self.fe_graphs, self.graphs = {}, {}
+                torch.cuda.synchronize(self.device)
+                torch.cuda.empty_cache()
+                graphs = False
+        if not graphs:
             for t in warmup:
                 self.read(np.zeros((t, 96, 96), np.uint8))
         self.warmup_s = time.perf_counter() - t0
