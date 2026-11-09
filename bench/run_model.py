@@ -93,7 +93,6 @@ def run(name, checkpoint, description, channels=tuple(CHANNEL_CONFIGS), devices=
                 with Timer() as t:
                     x = load_utterance(os.path.join(DATA_ROOT, it['session_dir']), it['index'],
                                        keep_channels=CHANNEL_CONFIGS[ch]['keep_channels'], preprocess=preprocess,
-                                       # pylint: disable-next=possibly-used-before-assignment
                                        gain=session_gain(it['session_dir'], stats) if stats else None)
                 prepared[ch, split, it['id']] = (x, t.ms)
                 if split == 'open_vocab_test':

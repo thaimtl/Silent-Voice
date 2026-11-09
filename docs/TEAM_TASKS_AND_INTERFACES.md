@@ -111,7 +111,7 @@ flowchart TD
 | `claude.repair` | Claude → Austin, dashboard | on reply | `utt_id`, `edits` [{`index`, `from`, `to`}], `please_repeat` |
 | `dec.pause` | Austin → Claude | when Austin's lips stop, and again while the answer is no | `utt_id`, `words` (the sentence so far), `n_words`, `silence_s`, `ask` |
 | `claude.end` | Claude → Austin | on reply | `utt_id`, `p_complete` (0 to 1: has he finished?), `ask` |
-| `dec.sentence` | Austin → logger, Claude | on each hold, continuation and close | `utt_id`, `event` (`hold` / `continue` / `close`), `reason` (judge spoke, Claude: finished, Claude did not answer, backstop, no Claude, please repeat), `held_s`, `p`, `asks`, `segments`, `words` |
+| `dec.sentence` | Austin → logger | on each hold, continuation and close | `utt_id`, `event` (`hold` / `continue` / `close`), `reason` (judge spoke, Claude: finished, Claude did not answer, backstop, no Claude, please repeat), `held_s`, `p`, `asks`, `segments`, `words` |
 | `voice.say` | Austin → Frank | words leaving the repair window | `utt_id`, `words` (only the new ones), `offset` (index of `words[0]` in the sentence, optional), `final`, `pace`, `effort` (both relative, 1.0 = Austin's normal; below) |
 | `partner.text` | Frank → Claude, dashboard | streaming | `text`, `is_final`, `t`, `source` (`ink`, or `sms` when the judge texts: one final line per text) |
 | `call.state` | Frank → dashboard | on change | `state` (`connected` / `ended` / `channel`), `t`, plus `call_sid`, `ink` and `channel` (`call` or `sms`) on connect; `state: channel` when the mode is switched (dashboard Call / Text switch), with `channel` and `ink` |

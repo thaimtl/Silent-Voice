@@ -1,6 +1,6 @@
 # Live benchmark: Austin mouths these in this order, one per sentence, with a clear pause (about 2 s) after each,
 # so every run is scored against the same truth. Same conditions each time: light, camera position, EMG on or off.
-# Groups: A demo lines, B near the demo lines (must not be confused with them), C free speech,
+# Groups: A known lines (fusion/script.txt), B near the known lines (must not be pulled to them), C free speech,
 # D lip look-alikes (b/m/p, f/v, t/d/n), E short replies, F names and numbers.
 # A
 hi i'm austin and right now i'm not making a sound
