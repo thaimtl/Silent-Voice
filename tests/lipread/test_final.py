@@ -1,18 +1,23 @@
 """E6 final pass: submit never blocks, queue policy, cam.final valid on the bus, clean close, and the real beam + LM on
-the sample (the fixes greedy misses).
+the sample (the fixes greedy misses). GPU rescoring: publishes before submit returns, ranks with the live model's CTC
+head, and finds the same fixes on the sample; the CPU child loads the face adapter's CTC head.
 
     venv-live/bin/python -m pytest tests/lipread/test_final.py -q
 """
+import os
+import sys
 import threading
 import time
 from collections import Counter
 
 import numpy as np
 import pytest
+import torch
 
 import lipread
+import lipread.final as final
 from bus import CamFinal, decode, encode, validate
-from lipread.final import FinalPass, RemoteBeam
+from lipread.final import FinalPass, GpuFinal, RemoteBeam, Rescore
 
 from .conftest import needs_cuda, needs_sample, needs_weights
 
@@ -207,3 +212,189 @@ def test_real_beam_on_the_sample(sample_video, face_model):
     check_sample_nbest(gpu)
     assert gpu[0][0] == sent[0].nbest[0][0]
     print(f'\nbeam {fp.stats[0]["beam_ms"]:.0f} ms (process, CPU), best: {sent[0].nbest[0]}')
+
+
+def test_gpu_final_publishes_before_submit_returns_and_survives_a_failure():
+    calls = []
+
+    def rescore(rois, enc):
+        calls.append(len(enc))
+        if len(calls) == 1:
+            raise RuntimeError('boom')
+        return (('HELLO WORLD', -1.5), ('HELLO WORD', -2.5))
+
+    sent = []
+    fp = GpuFinal(None, sent.append, rescore=rescore)
+    assert fp.submit(1, rois(1), enc=np.zeros((50, 4), np.float32))
+    assert fp.submit(2, rois(2), enc=np.zeros((60, 4), np.float32))
+    assert fp.errors == [1] and [m.seg_id for m in sent] == [2]
+    validate(*decode(encode(sent[0], seq=1)))
+    assert sent[0].nbest == (('HELLO WORLD', -1.5), ('HELLO WORD', -2.5))
+    assert [(s['seg_id'], s['T']) for s in fp.stats] == [(2, 50)]
+    assert fp.close() and not fp.submit(3, rois(3), enc=np.zeros((5, 4), np.float32)) and len(sent) == 1
+
+
+class FlatDecoder:
+    """Attention decoder with the same output for every token: rescoring then ranks by CTC alone."""
+
+    def parameters(self):
+        import torch
+        return iter([torch.zeros(1)])
+
+    def __call__(self, ys_in, mask, mem, cache):
+        import torch
+        return torch.zeros((*ys_in.shape, 6)), None
+
+
+class CtcHead:
+    """CTC head whose log-probs favour one label path, frame by frame (blank 0)."""
+
+    def __init__(self, path):
+        self.path = path
+
+    def log_softmax(self, x):
+        import torch
+        logp = torch.full((1, len(self.path), 6), -9.0)
+        logp[0, torch.arange(len(self.path)), torch.tensor(self.path)] = -0.01
+        return logp
+
+
+class TinyModel:
+    """LiveModel's surface as Rescore uses it: tokens <blank> HI THERE YOU NOW <eos>."""
+
+    def __init__(self, path):
+        from types import SimpleNamespace
+        import torch
+        self.token_list = ['<blank>', '▁HI', '▁THERE', '▁YOU', '▁NOW', '<eos>']
+        self.device = torch.device('cpu')
+        self.ctc = CtcHead(path)
+        self.reader = SimpleNamespace(model=SimpleNamespace(eos=5, adim=4, decoder=FlatDecoder()))
+
+
+def test_rescore_ranks_with_the_live_models_ctc_head():
+    """An adapter that retrains the CTC head (recipe C) changes what the GPU final pass reads: it uses model.ctc."""
+    enc = np.zeros((6, 4), np.float32)
+    kw = dict(lm_weight=0.0, att_beam=0, ctc_weight=1.0, per_frame=4)
+    a = Rescore(TinyModel([1, 0, 2, 2, 0, 0]), **kw)(enc=enc)
+    b = Rescore(TinyModel([3, 0, 4, 4, 0, 0]), **kw)(enc=enc)
+    assert a[0][0] == 'HI THERE' and b[0][0] == 'YOU NOW'
+    for nb in (a, b):
+        texts, scores = [t for t, _ in nb], [s for _, s in nb]
+        assert 1 <= len(nb) <= 5 and len(set(texts)) == len(texts)
+        assert scores == sorted(scores, reverse=True) and all(np.isfinite(scores))
+    assert Rescore(TinyModel([0]), **kw)(enc=np.zeros((0, 4), np.float32)) == (('', 0.0),)
+
+
+@needs_weights
+def test_the_cpu_child_loads_the_adapters_ctc_head(tmp_path):
+    """A face adapter whose CTC head allows only one label: the child's best reading then has nothing else."""
+    import queue as q
+    import signal
+    import torch
+    from lipflow.vsr import LipReader
+    from lipread.final import _child
+    tokens = LipReader(device='cpu', use_lm=False, personal=False).token_list
+    the = tokens.index('▁THE')
+    bias = torch.full((len(tokens),), -1000.0)
+    bias[0] = bias[the] = 0.0
+    path = tmp_path / 'ctc_only_the.pth'
+    torch.save({'ctc.ctc_lo.weight': torch.zeros((len(tokens), 768)), 'ctc.ctc_lo.bias': bias}, path)
+    enc = np.random.default_rng(0).normal(size=(40, 768)).astype(np.float32)
+    kw = dict(beam_size=5, nbest=5, lm_weight=0.0, ctc_weight=0.1)
+    old = signal.getsignal(signal.SIGINT)
+    texts = {}
+    try:
+        for name, fa in (('base', None), ('adapter', str(path))):
+            jobs, results = q.Queue(), q.Queue()
+            jobs.put(enc)
+            jobs.put(None)
+            _child(jobs, results, kw, 'cpu', 2, 0, fa)
+            assert results.get_nowait()[0] == 'ready'
+            texts[name] = [t for t, _ in results.get_nowait()[0]]
+    finally:
+        signal.signal(signal.SIGINT, old)
+    assert set(texts['adapter'][0].split()) <= {'THE'}, texts
+    assert texts['base'][0] != texts['adapter'][0], texts
+
+
+@needs_weights
+@needs_cuda
+@needs_sample
+def test_gpu_rescoring_on_the_sample(sample_video, face_model):
+    """The tick's encoder output -> GPU rescoring on the tick thread: cam.final before submit returns, with the fixes
+    greedy misses."""
+    from lipread.model import LiveModel
+    x = sample_rois(sample_video, face_model)
+    model = LiveModel(warmup=(25,))
+    r = model.read(x, keep_enc=True)
+    sent = []
+    fp = GpuFinal(model, sent.append)
+    t0 = time.perf_counter()
+    assert fp.submit(3, x, enc=r.enc)
+    ms = (time.perf_counter() - t0) * 1000
+    assert len(sent) == 1 and sent[0].seg_id == 3
+    validate(*decode(encode(sent[0])))
+    nbest = sent[0].nbest
+    texts, scores = [t for t, _ in nbest], [s for _, s in nbest]
+    assert 1 <= len(nbest) <= 5 and len(set(texts)) == len(texts)
+    assert scores == sorted(scores, reverse=True) and all(np.isfinite(scores))
+    assert 'AND RAISED MOSTLY' in texts[0] and 'FORTY THREE' in texts[0], texts
+    truth = Counter(lipread.SAMPLE_TEXT.split())
+    assert sum((truth & Counter(texts[0].split())).values()) >= 15, texts[0]
+    assert fp.rescore(x) == nbest
+    print(f'\nGPU rescoring {ms:.0f} ms (T {len(x)}), best: {sent[0].nbest[0]}')
+
+
+class Loaded(Exception):
+    pass
+
+
+@pytest.mark.parametrize('windows', [False, True])
+def test_the_final_pass_child_ignores_the_launchers_stop_signal(monkeypatch, windows):
+    """The launcher stops the camera's whole process group (SIGINT on POSIX, CTRL_BREAK on Windows); the child ignores
+    it so the parent can finish its last segment and stop it."""
+    import signal
+    set_to = {}
+    if windows:
+        monkeypatch.setattr(signal, 'SIGBREAK', signal.SIGUSR1, raising=False)
+    else:
+        monkeypatch.delattr(signal, 'SIGBREAK', raising=False)
+    monkeypatch.setattr(signal, 'signal', lambda sig, handler: set_to.__setitem__(sig, handler))
+
+    def stop(nice):
+        raise Loaded
+    monkeypatch.setattr(final, 'lower_priority', stop)
+    with pytest.raises(Loaded):
+        final._child(None, None, {}, 'cpu', torch.get_num_threads(), 10)
+    assert set_to == {signal.SIGINT: signal.SIG_IGN, **({signal.SIGUSR1: signal.SIG_IGN} if windows else {})}
+
+
+def test_lower_priority_without_nice_uses_below_normal_priority_class(monkeypatch):
+    import ctypes
+    import types
+    calls = []
+    kernel32 = types.SimpleNamespace(GetCurrentProcess=lambda: -1, SetPriorityClass=lambda h, c: calls.append((h, c)))
+    monkeypatch.delattr(os, 'nice')
+    monkeypatch.setattr(sys, 'platform', 'win32')
+    monkeypatch.setattr(ctypes, 'windll', types.SimpleNamespace(kernel32=kernel32), raising=False)
+    final.lower_priority(0)
+    final.lower_priority(10)
+    assert calls == [(-1, 0x4000)]
+
+
+def test_the_final_pass_child_survives_a_spawn():
+    """Windows starts processes only by spawn: the target pickles by reference, and the modules a spawned child imports
+    (lipread.final, and lipread.run as the parent's __main__ under demo.run_part) import without side effects."""
+    import multiprocessing as mp
+    import pickle
+    from tests.lipread import fake_children
+    assert pickle.loads(pickle.dumps(final._child)) is final._child
+    ctx = mp.get_context('spawn')
+    results = ctx.Queue()
+    p = ctx.Process(target=fake_children.imports, args=(results, ['lipread.final', 'lipread.run', 'demo.run_part']))
+    p.start()
+    try:
+        assert results.get(timeout=120) == 'ok'
+    finally:
+        p.join(30)
+    assert p.exitcode == 0

@@ -16,3 +16,14 @@ def echo(jobs, results, *args):
         if len(enc) == 0:
             os._exit(9)
         results.put(((('HI', -1.0),), 1.0))
+
+
+def imports(results, names):
+    """Imports what a spawned child would, then reports; any failure reaches the parent as its text."""
+    import importlib
+    try:
+        for name in names:
+            importlib.import_module(name)
+        results.put('ok')
+    except BaseException as e:  # noqa: BLE001
+        results.put(f'{type(e).__name__}: {e}')

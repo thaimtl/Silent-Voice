@@ -1,5 +1,6 @@
 """The face adapter: lipread/adapt.py's data handling, and LiveModel loading an adapter over the base weights."""
 import json
+import os
 
 import numpy as np
 import pytest
@@ -90,3 +91,148 @@ def test_a_file_with_other_tensors_is_refused(tmp_path, adapter_file):
     reader = LipReader(device='cpu', use_lm=False, personal=False)
     with pytest.raises(ValueError, match='not a face adapter'):
         load_face_adapter(reader.model, str(tmp_path / 'bad.pth'))
+
+
+def test_averaged_adapters_are_the_mean_and_mismatched_files_are_refused(tmp_path, adapter_file):
+    import torch
+    from lipread.average_adapters import main
+    path, state = adapter_file
+    other = {k: v + 1.0 if v.is_floating_point() else v for k, v in state.items()}
+    other['encoder.embed.num_batches_tracked'] = torch.tensor(7)
+    first = dict(state, **{'encoder.embed.num_batches_tracked': torch.tensor(3)})
+    torch.save(first, tmp_path / 'a.pth')
+    torch.save(other, tmp_path / 'b.pth')
+    main([str(tmp_path / 'soup.pth'), str(tmp_path / 'a.pth'), str(tmp_path / 'b.pth')])
+    soup = torch.load(tmp_path / 'soup.pth', weights_only=True)
+    k = next(iter(state))
+    assert torch.allclose(soup[k], state[k] + 0.5, atol=1e-6) and soup['encoder.embed.num_batches_tracked'] == 3
+    torch.save({k: state[k]}, tmp_path / 'c.pth')
+    with pytest.raises(ValueError, match='same tensors'):
+        main([str(tmp_path / 'bad.pth'), str(tmp_path / 'a.pth'), str(tmp_path / 'c.pth')])
+
+
+class FakeReader:
+    """Enough of a LipReader for word_ends: 4 tokens, two words, 'A' = 1 token, 'BC' = 2 tokens."""
+    token_list = ['<blank>', '▁A', '▁B', 'C']
+    enc_device = 'cpu'
+
+    def __init__(self):
+        import torch
+        self.encoded = 0
+        outer = self
+
+        class Enc:
+            def __call__(self, x, _):
+                outer.encoded += 1
+                return x, None
+
+        class Ctc:
+            def log_softmax(self, enc):
+                return enc.log_softmax(-1)
+
+        self.model = type('M', (), dict(encoder=Enc(), ctc=Ctc()))()
+        self._torch = torch
+
+    def to_tensor(self, rois):
+        t = self._torch.zeros(len(rois), 4)
+        t[:, 0] = 5.0
+        for frame, tok in ((2, 1), (4, 2), (6, 3)):
+            t[frame, 0], t[frame, tok] = 0.0, 9.0
+        return t
+
+
+def test_word_ends_are_cached_and_a_hit_skips_the_encoder(tmp_path):
+    from lipread.adapt import load_alignments, save_alignments, word_ends
+    reader, cache = FakeReader(), {}
+    rois = np.zeros((10, 96, 96), np.uint8)
+    word_of, ends = word_ends(reader, rois, [1, 2, 3], 'clip_1', cache)
+    assert word_of == [0, 1, 1] and ends == [3, 7] and reader.encoded == 1
+    save_alignments(str(tmp_path / 'sub' / 'align.json'), cache)
+    cache = load_alignments(str(tmp_path / 'sub' / 'align.json'))
+    assert cache['clip_1']['words'] == ['A', 'BC'] and len(cache['clip_1']['starts']) == 2
+    assert word_ends(reader, rois, [1, 2, 3], 'clip_1', cache) == (word_of, ends) and reader.encoded == 1
+    word_ends(reader, rois, [1, 2, 3], 'clip_2', cache)
+    assert reader.encoded == 2
+    assert load_alignments(str(tmp_path / 'none.json')) == {}
+
+
+def test_concurrent_saves_of_one_alignment_cache_all_succeed(tmp_path):
+    from concurrent.futures import ThreadPoolExecutor
+    from lipread.adapt import load_alignments, save_alignments
+    path = str(tmp_path / 'align.json')
+    caches = [{f'clip_{i}': dict(words=['A'], starts=[0], ends=[1])} for i in range(8)]
+    with ThreadPoolExecutor(8) as pool:
+        list(pool.map(lambda c: [save_alignments(path, c) for _ in range(50)], caches))
+    assert load_alignments(path) in caches
+    assert sorted(os.listdir(tmp_path)) == ['align.json']
+
+
+def test_recipe_c_is_the_default_and_flags_override_it():
+    from lipread.adapt import RECIPES, resolve_recipe
+    assert resolve_recipe('c') == dict(cut_p=0.5, ctc_weight=0.5, train_ctc=True, extra_blocks=2)
+    assert resolve_recipe('lipflow') == RECIPES['lipflow'] == dict(cut_p=0.0, ctc_weight=0.1, train_ctc=False,
+                                                                    extra_blocks=0)
+    assert resolve_recipe('c', cut_p=0.0, train_ctc=False)['train_ctc'] is False
+    assert resolve_recipe('c', extra_blocks=0) == dict(cut_p=0.5, ctc_weight=0.5, train_ctc=True, extra_blocks=0)
+
+
+@pytest.fixture
+def fake_main(monkeypatch, tmp_path):
+    """adapt.main with every heavy part replaced; log records the calls."""
+    import sys
+    import types
+    import lipread.adapt as adapt
+    log = dict(finetune=None, saved=[], beam=0, seen=[])
+    rows = [dict(id=f's1_{i:03d}', prompt='Hi.', dir='session_01') for i in range(10)]
+    monkeypatch.setattr(adapt, 'sentence_clips', lambda sessions: list(rows) if sessions else [])
+    monkeypatch.setattr(adapt, 'crops', lambda r, face: np.zeros((5, 96, 96), np.uint8))
+    monkeypatch.setattr(adapt, 'score', lambda *a: (0.5, 0.4, 0, 0))
+
+    def finetune(clips, reader, **kw):
+        log['finetune'] = kw
+        return ('encoder.',)
+    monkeypatch.setattr(adapt, 'finetune', finetune)
+    monkeypatch.setattr(adapt, 'save', lambda reader, path, prefixes: (log['saved'].append(path),
+                                                                      open(path, 'w').close(), 1)[2])
+    monkeypatch.setattr(adapt, 'ALIGN_CACHE', str(tmp_path / 'align.json'))
+    seen = iter([0.30, 0.35])
+    monkeypatch.setattr(adapt, 'streaming_seen', lambda *a, **k: dict(seen_wer=next(seen)))
+    monkeypatch.setitem(sys.modules, 'lipflow.vsr', types.SimpleNamespace(LipReader=lambda **k: object()))
+    monkeypatch.setitem(sys.modules, 'lipflow.train_vsr', types.SimpleNamespace(DEFAULT_SCOPE='scope'))
+
+    class Beam:
+        def __init__(self, reader):
+            log['beam'] += 1
+    monkeypatch.setitem(sys.modules, 'lipread.final', types.SimpleNamespace(Beam=Beam))
+    monkeypatch.setitem(sys.modules, 'lipread.model', types.SimpleNamespace(
+        LiveModel=lambda **k: object(), FACE_ADAPTER_PREFIXES=adapt.FACE_ADAPTER_PREFIXES))
+    return adapt, log
+
+
+def test_main_trains_recipe_c_and_builds_no_beam_without_a_test_set(fake_main, tmp_path):
+    adapt, log = fake_main
+    assert adapt.main(['--out', str(tmp_path / 'a.pth')]) == 0
+    assert log['beam'] == 0 and log['saved'] == [str(tmp_path / 'a.pth')]
+    assert (log['finetune']['cut_p'], log['finetune']['ctc_weight'], log['finetune']['train_ctc'],
+            log['finetune']['extra_blocks']) == (0.5, 0.5, True, 2)
+    assert log['finetune']['align_cache'] == adapt.ALIGN_CACHE
+    adapt.main(['--recipe', 'lipflow', '--no-train-ctc', '--out', str(tmp_path / 'b.pth')])
+    assert log['finetune']['cut_p'] == 0.0 and log['finetune']['train_ctc'] is False
+
+
+def test_main_gates_saving_on_the_seen_wer(fake_main, tmp_path):
+    adapt, log = fake_main
+    out = tmp_path / 'a.pth'
+    assert adapt.main(['--test-every', '5', '--out', str(out)]) == 1
+    assert log['beam'] == 1 and not out.exists() and not (tmp_path / 'a.pth.candidate').exists()
+    assert log['saved'] == [str(out) + '.candidate']
+
+
+def test_main_saves_a_worse_adapter_with_force_and_a_better_one_without(fake_main, tmp_path, monkeypatch):
+    adapt, log = fake_main
+    out = tmp_path / 'a.pth'
+    assert adapt.main(['--test-every', '5', '--force', '--out', str(out)]) == 0 and out.exists()
+    seen = iter([0.30, 0.25])
+    monkeypatch.setattr(adapt, 'streaming_seen', lambda *a, **k: dict(seen_wer=next(seen)))
+    out.unlink()
+    assert adapt.main(['--test-every', '5', '--out', str(out)]) == 0 and out.exists()

@@ -10,9 +10,12 @@ Conformer, CTC), peak GPU memory, and whether the 40 ms p95 target at 8 s holds.
     venv-live/bin/python -m lipread.bench.tick_bench                 # ~2 min; paste the output back
     venv-live/bin/python -m lipread.bench.tick_bench --gap 0         # back to back (GPU kept busy), for comparison
     venv-live/bin/python -m lipread.bench.tick_bench --tick-ms 200   # the old 200 ms schedule
+    venv-live/bin/python -m lipread.bench.tick_bench --no-graphs     # eager reads (no CUDA graphs)
+    venv-live/bin/python -m lipread.bench.tick_bench --hog           # beside a busy pure-Python thread (GIL)
 """
 import argparse
 import os
+import threading
 import time
 
 import numpy as np
@@ -68,20 +71,27 @@ def main():
     ap.add_argument('--reps', type=int, default=3)
     ap.add_argument('--only', choices=('fp32', 'fp16'), default=None)
     ap.add_argument('--no-fe-cache', action='store_true', help='re-run the front end on the whole segment')
+    ap.add_argument('--no-graphs', action='store_true', help='eager reads instead of one CUDA graph per length')
+    ap.add_argument('--hog', action='store_true', help='run beside a pure-Python busy thread (as MediaPipe, emotion)')
     args = ap.parse_args()
     rois, what = sample_rois()
     print(f'GPU {torch.cuda.get_device_name(0)}, {what}, ticks every {args.tick_ms} ms, gap {args.gap * 1000:.0f} ms, '
-          f'reps {args.reps}')
+          f'reps {args.reps}, {"eager" if args.no_graphs else "CUDA graphs"}{", busy thread" if args.hog else ""}')
+    stop = threading.Event()
+    if args.hog:
+        threading.Thread(target=hog, args=(stop,), daemon=True).start()
     for half in (False, True):
         name = 'fp16' if half else 'fp32'
         if args.only and args.only != name:
             continue
         torch.cuda.reset_peak_memory_stats()
         t0 = time.perf_counter()
-        m = LiveModel(half=half)
+        m = LiveModel(half=half, graphs=False if args.no_graphs else None)
         load = time.perf_counter() - t0
+        reserved = torch.cuda.memory_reserved()
         res = run(m, rois, args.gap, args.reps, args.tick_ms, not args.no_fe_cache)
-        print(f'\n{name}: load + warm-up {load:.1f} s (warm-up {m.warmup_s:.1f} s), '
+        print(f'\n{name}: load + warm-up {load:.1f} s (warm-up {m.warmup_s:.1f} s, {len(m.graphs)} graphs), '
+              f'reserved after warm-up {reserved / 2 ** 20:.0f} MiB, '
               f'peak GPU {torch.cuda.max_memory_allocated() / 2 ** 20:.0f} MiB')
         for s, st in res.items():
             tot = [x.total_ms for x in st]
@@ -93,6 +103,12 @@ def main():
         print(f'  target p95 < {TARGET_MS:.0f} ms at 8 s: {"OK" if p95_8 < TARGET_MS else "MISS"} ({p95_8:.1f} ms)')
         del m
         torch.cuda.empty_cache()
+    stop.set()
+
+
+def hog(stop):
+    while not stop.is_set():
+        sum(k * k for k in range(20000))
 
 
 if __name__ == '__main__':

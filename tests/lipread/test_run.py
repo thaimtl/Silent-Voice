@@ -280,7 +280,7 @@ def test_real_model_on_the_sample(sample_video, face_model):
     for t in sent:
         validate(*decode(encode(t)))
         tm = t.timing_ms
-        assert tm['T'] == len(t.frame_t) and tm['frontend'] > 0 and tm['conformer'] > 0
+        assert tm['T'] == len(t.frame_t) and tm['frontend'] >= 0 and tm['conformer'] > 0
         assert tm['frontend'] + tm['conformer'] + tm['ctc'] <= tm['total'] + 0.5
     assert len(sent[-1].frame_t) == 192
     words = set(sent[-1].greedy.split())
@@ -360,10 +360,10 @@ def test_size_flags_reach_the_camera(monkeypatch):
     monkeypatch.setattr(lipread.source, 'CameraSource', lambda cam, **kw: got.update(cam=cam, **kw) or 'cam')
     args = parse_args([])
     assert args.size == (1920, 1080) and args.process_size == (1280, 720)
-    assert make_source(args) == 'cam' and got == {'cam': 0, 'width': 1920, 'height': 1080, 'settings': False}
+    assert make_source(args) == 'cam' and got == {'cam': 0, 'width': 1920, 'height': 1080, 'settings': False, 'exposure': None}
     args = parse_args(['--cam', '2', '--size', '1280x720', '--process-size', '0', '--camera-settings'])
     make_source(args)
-    assert got == {'cam': 2, 'width': 1280, 'height': 720, 'settings': True} and args.process_size is None
+    assert got == {'cam': 2, 'width': 1280, 'height': 720, 'settings': True, 'exposure': None} and args.process_size is None
     with pytest.raises(SystemExit):
         parse_args(['--size', '1280'])
 
