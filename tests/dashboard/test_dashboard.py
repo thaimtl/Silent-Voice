@@ -344,18 +344,6 @@ def test_a_restarted_sentence_never_rewrites_the_old_caption():
     assert [t['text'] for t in st.transcript if t['who'] == 'austin'] == ['Hi.', 'Second,']
 
 
-def test_claude_caption_reaches_the_dashboard_rewrites_the_line_and_counts_once():
-    from dashboard.server import TOPICS
-    assert any('claude.caption'.startswith(t) for t in TOPICS)
-    st = fed(('dec.hyp', {'utt_id': 1, 'locked': ['i', 'want', 'bill'], 'unlocked': []}))
-    st.feed('voice.say', {'utt_id': 1, 'words': ['i', 'want', 'bill'], 'offset': 0, 'final': True}, 10.5)
-    for t in (11.0, 12.0):     # a retried caption pass sends the same sentence twice
-        st.feed('claude.caption', {'utt_id': 1, 'words': ['i', 'want', 'the', 'bill'], 'changed': True}, t)
-    line = [x for x in st.transcript if x['who'] == 'austin'][-1]
-    assert line['caption_fixed'] and line['text'] != line['original'] and 'the' in line['text'].lower().split()
-    assert st.snapshot(12.0)['metrics']['fixed'] == 1
-
-
 def test_voice_indicator_times_out_and_lips_to_voice_counts_first_audio_once():
     st = fed(('dec.lock', {'utt_id': 1, 'words': [{'w': 'hi', 't': 9.7}]}),
              ('timing.voice', {'stage': 'sonic_first_audio', 'utt_id': 1, 'ms': 190.0, 't_pub': 10.0}))

@@ -25,6 +25,7 @@ finished candidates costs one GPU call instead of thousands of tiny ones.
 The gate is a softmax over (camera, EMG, LM) from a linear layer on six signals, times one learned scale; it is
 fitted on sessions 1 and 2 by making the true sentence win among the candidates (python -m fusion.offline fit).
 """
+import functools
 import math
 import os
 import sys
@@ -249,6 +250,60 @@ def gate_features(cam, emg_read, emg_quality):
     return np.array([conf, face, act, speak, emg_quality, rate])
 
 
+# Austin's known lines (fusion/script.txt): where the camera's reading of a span looks like one on the lips (sharing
+# a word the camera read exactly), that span of the line races too, with a bonus. Claude can't know his exact words;
+# the script does, for the lines he says on every demo. Free speech never lip-matches a line this closely.
+SCRIPT_LIP = 0.6       # lip similarity (viseme sequences, 0 to 1) a span needs; random word pairs reach it 6% of the time
+SCRIPT_MIN_WORDS = 3   # ... over at least this many words
+SCRIPT_BONUS = 3.0     # added to a matching candidate's hint score (times beta)
+SCRIPT_CANDS = 6       # spans per pass
+
+
+# letters -> rough lip shapes, for words no lexicon knows (the camera's own inventions, "burinadoes")
+LETTER_VISEME = {**{c: 'P' for c in 'bmp'}, **{c: 'F' for c in 'fv'}, **{c: 'T' for c in 'tdnl'},
+                 **{c: 'S' for c in 'szcx'}, **{c: 'K' for c in 'kgq'}, 'j': 'SH', 'r': 'R', 'w': 'W', 'y': 'Y',
+                 'h': 'H', 'a': 'A', 'e': 'E', 'i': 'E', 'o': 'O', 'u': 'O'}
+
+
+@functools.lru_cache(maxsize=50000)
+def visemes(word):
+    """A word's lip shapes: its pronunciation (CMUdict + our supplement) as viseme classes, else from its letters
+    (doubled letters once)."""
+    from bench.lookalikes import VISEME
+    from svr.phonemes import cmudict
+    p = cmudict().get(word)
+    if p:   # "h" is just breath on the lips, nothing like the k/g group bench.lookalikes files it under
+        return tuple('H' if x == 'HH' else VISEME.get(x, x) for x in p)
+    return tuple(v for i, ch in enumerate(word)
+                 if (v := LETTER_VISEME.get(ch)) and not (i and word[i - 1] == ch))
+
+
+@functools.lru_cache(maxsize=200000)
+def lip_similarity(a, b):
+    """How alike two word sequences (tuples) look on the lips: 1 - viseme edit distance / the longer (1 = identical)."""
+    x = [v for w in a for v in visemes(w)]
+    y = [v for w in b for v in visemes(w)]
+    if not x or not y:
+        return 0.0
+    d = list(range(len(y) + 1))
+    for i, xi in enumerate(x, 1):
+        prev, d[0] = d[0], i
+        for j, yj in enumerate(y, 1):
+            prev, d[j] = d[j], min(d[j] + 1, d[j - 1] + 1, prev + (xi != yj))
+    return 1.0 - d[-1] / max(len(x), len(y))
+
+
+def load_script(path=None):
+    """fusion/script.txt (one line per sentence, '#' comments) -> [word tuples]."""
+    path = path or os.path.join(os.path.dirname(os.path.abspath(__file__)), 'script.txt')
+    try:
+        with open(path, encoding='utf-8') as f:
+            lines = [norm_words(x) for x in f if x.strip() and not x.lstrip().startswith('#')]
+    except OSError:
+        return []
+    return [tuple(x) for x in lines if x]
+
+
 class Cand:
     __slots__ = ('words', 'tokens', 'source')
 
@@ -272,6 +327,8 @@ class JointSearch:
                                                                                      max_cands, max_new)
         self.inserts, self.phrase_cands = inserts, phrase_cands
         self._lk = {}
+        self.script = []            # Austin's known lines (load_script); empty offline, so the fitted runs stay as they were
+        self.script_hits = set()    # this pass's candidates that are a span of one
 
     # ------------------------------------------------------------------ language side
     def word_bonus(self, state, word, w, hints):
@@ -370,6 +427,12 @@ class JointSearch:
         if base:
             for words, tokens in self.phrase_fill(base[0], phrases, len(locked))[:self.phrase_cands]:
                 add(words, tokens, 'phrase')
+        self.script_hits = set()
+        if base and self.script:
+            for span in self.script_spans(base[0].words, len(locked)):
+                words = locked + span
+                self.script_hits.add(words)
+                add(words, lock_tok + [p.word_ids(x) for x in span], 'script')
         for words, tokens in self.short_inserts(base, len(locked), final)[:self.inserts]:
             add(words, tokens, 'insert')
         firsts = [c for c in out if c.source == 'camera'][:self.swap_top]
@@ -382,6 +445,28 @@ class JointSearch:
         if not out:
             add(locked, lock_tok, 'locked')
         return out
+
+    def script_spans(self, best, k):
+        """Spans of Austin's known lines that look like the camera's best reading after the k locked words: anchored
+        where a line has a word the camera read exactly (len > 3), one word shorter, as long, or one word longer."""
+        read = tuple(best[k:])
+        if len(read) < SCRIPT_MIN_WORDS:
+            return []
+        out = {}
+        anchors = {w: j for j, w in enumerate(read) if len(w) > 3}
+        for line in self.script:
+            for i, w in enumerate(line):
+                j = anchors.get(w)
+                if j is None:
+                    continue
+                s = i - j
+                for n in (len(read) - 1, len(read), len(read) + 1):
+                    span = line[max(0, s):max(0, s) + n]
+                    if len(span) >= SCRIPT_MIN_WORDS and span not in out:   # the exact reading too: its bonus
+                        lip = lip_similarity(span, read)
+                        if lip >= SCRIPT_LIP:
+                            out[span] = lip
+        return sorted(out, key=lambda x: -out[x])[:SCRIPT_CANDS]
 
     def short_inserts(self, base, start, final):
         """(words, tokens) of each base reading with one short word inserted (unseen), best LM gain first."""
@@ -467,7 +552,8 @@ class JointSearch:
             emg_s = emg_fn([' '.join(c.words) for c in cands])
         emg_s = np.zeros(K) if emg_s is None else np.asarray(emg_s, np.float64)
         lm_s = np.array([self.lm_score(c.words, final) for c in cands])
-        hint_s = np.array([sum(hints.get(x, 0.0) for x in set(c.words)) for c in cands])
+        hint_s = np.array([sum(hints.get(x, 0.0) for x in set(c.words)) + SCRIPT_BONUS * (c.words in self.script_hits)
+                           for c in cands])
         n = np.array([len(c.words) for c in cands], np.float64)
         fin = np.zeros(K)
         listed = {}

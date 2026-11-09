@@ -97,6 +97,8 @@ def main():
                     help='Please repeat only when the sentence confidence is below this (0: never; default: fitted)')
     ap.add_argument('--no-emg', action='store_true', help='camera + LM + Claude only')
     ap.add_argument('--no-claude', action='store_true', help="ignore Claude's predictions and repairs")
+    ap.add_argument('--script', default=None, help="Austin's known lines (default fusion/script.txt)")
+    ap.add_argument('--no-script', action='store_true', help='no known lines: free speech only')
     ap.add_argument('--calibrate', type=float, default=0.0, metavar='S',
                     help='refit the EMG gains on the first S s and save them (default: reuse the last saved ones)')
     ap.add_argument('--sub', action='append', default=[], help='endpoints to connect to (default cam emg claude call)')
@@ -120,6 +122,10 @@ def main():
         from svr.live import LiveSVR1
         live = LiveSVR1(args.svr)
     search = build_search()
+    if not args.no_script:
+        from fusion.search import load_script
+        search.script = load_script(args.script)
+        print(f'fusion: {len(search.script)} known lines from {args.script or "fusion/script.txt"}', file=sys.stderr)
     topics = [t for t in TOPICS if not (args.no_claude and t.startswith('claude.'))]
     sub = Sub(args.sub or ['cam', 'emg', 'claude', 'call'], topics, rcvhwm=2000)
     pub = Pub(args.pub)

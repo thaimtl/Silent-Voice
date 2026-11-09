@@ -1,0 +1,17 @@
+# Austin's known lines (fusion/search.py, load_script): one sentence per line, plain words, '#' for comments.
+# Where the camera's reading looks like a span of one of these on the lips, that span races in the decoder with a
+# bonus, so these lines come out right. Only lines he really says: a wrong line here pulls look-alike speech to it.
+# Drafted from the corrected captions of the 2026-10-25 calls: fix them to the exact words he says.
+hi i'm austin and right now i'm not making a sound
+i'm speaking right now but i'm not making a sound
+we built a voice out of silence
+it reads the electrical signals of my muscles and looks at my lips
+it's not the camera it's my muscles
+it works in the dark where no camera is able to see
+it's a one forty five millimeter piece designed from scratch in thirty six hours
+the harder i push my words the louder my voice gets
+people who lost their voice box can speak again the moment they mouth their words
+we are a team of two
+i'm a student at mcgill university
+i'm doing great how are you
+i'm having a lot of fun
